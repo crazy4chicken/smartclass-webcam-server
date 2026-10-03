@@ -17,7 +17,7 @@ service is reachable in your deployment:
 http://webcam-server.example.com:8080/api/cameras
 ```
 
-See the [deployment guide](/deploy) for how the service is exposed in the
+See the [deployment guide](/guide/deploy) for how the service is exposed in the
 Nekostick fleet.
 
 ## Authentication

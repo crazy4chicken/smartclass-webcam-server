@@ -11,7 +11,7 @@ export default defineConfig({
   themeConfig: {
     nav: [
       { text: 'Guide', link: '/guide/getting-started' },
-      { text: 'Deployment', link: '/deploy' },
+      { text: 'Deployment', link: '/guide/deploy' },
       { text: 'API Reference', link: '/api/overview' },
       {
         text: 'GitHub',
@@ -23,15 +23,8 @@ export default defineConfig({
         {
           text: 'Guide',
           items: [
-            { text: 'Getting Started', link: '/guide/getting-started' }
-          ]
-        }
-      ],
-      '/deploy': [
-        {
-          text: 'Deployment',
-          items: [
-            { text: 'Deployment guide', link: '/deploy' }
+            { text: 'Getting Started', link: '/guide/getting-started' },
+            { text: 'Deployment', link: '/guide/deploy' }
           ]
         }
       ],

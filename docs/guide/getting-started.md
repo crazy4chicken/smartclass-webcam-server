@@ -65,7 +65,7 @@ The filehouse bucket must already exist; the S3 bucket is created on startup
 when it is missing. Both backends hand out short-lived presigned download URLs,
 so clients never hold storage credentials.
 
-See the [deployment guide](/deploy) for the full operator checklist.
+See the [deployment guide](/guide/deploy) for the full operator checklist.
 
 ## Run
 

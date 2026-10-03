@@ -11,7 +11,7 @@ hero:
       link: /guide/getting-started
     - theme: alt
       text: Deploy
-      link: /deploy
+      link: /guide/deploy
 
 features:
   - title: Camera registry and live status

@@ -56,9 +56,9 @@ the database, the storage bucket, and the teamusers permission and credential.
 
 ## Documentation
 
-- [Deployment guide](docs/deploy.md) - prerequisites, configuration reference, svchost compose example,
+- [Deployment guide](docs/guide/deploy.md) - prerequisites, configuration reference, svchost compose example,
   systemd unit, TLS, and operations.
-  Published at <https://crazy4chicken.github.io/smartclass-webcam-server/deploy>.
+  Published at <https://crazy4chicken.github.io/smartclass-webcam-server/guide/deploy>.
 - [API reference](https://crazy4chicken.github.io/smartclass-webcam-server/api/overview) - the management
   endpoints and the camera WebSocket protocol.
 - [Getting started](https://crazy4chicken.github.io/smartclass-webcam-server/guide/getting-started) - a
