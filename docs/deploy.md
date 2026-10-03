@@ -111,9 +111,8 @@ services:
       # Pushing a v* tag publishes smartclass-webcam-server_<version>_<arch>.zip
       # release assets through the release workflow.
       release: "github:crazy4chicken/smartclass-webcam-server@v0.1.0"
-      # Replace with the SHA-256 of smartclass-webcam-server_0.1.0_x64.zip.
-      # The placeholder below is 64 zeros; a real digest is 64 hexadecimal characters.
-      sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+      # SHA-256 of smartclass-webcam-server_0.1.0_x64.zip.
+      sha256: "eb52e6723e71fd9c3d118978db63c9e21d291b25346f74f33866c033de1a2019"
     env:
       # The host injects HOST and PORT for every launch. This service does not
       # read PORT itself: WEBCAM_LISTEN_ADDR is the only listen setting, and it
@@ -143,9 +142,13 @@ Notes:
   conflicting override. Because `WEBCAM_LISTEN_ADDR` defaults to `:8080` and the service does not read
   `PORT`, a deployment that leaves `WEBCAM_LISTEN_ADDR` unset will not bind the leased port. Set it to
   `"${HOST}:${PORT}"` as above, or verify by other means that the deployment binds the leased address.
-- `strictSources: true` requires the explicit `sha256`. One digest pins one architecture's ZIP; on
-  mixed-architecture fleets either drop `strictSources` (the lock still pins the first observed digest per
-  node) or split per-architecture documents under `serviceScope: document`.
+- `strictSources: true` requires the explicit `sha256`. The pinned digest above is the x64 asset;
+  `smartclass-webcam-server_0.1.0_arm64.zip` is
+  `3df8f27d02b42eb5f9221e00d88371b4831bf90fd0118dd912b7f82c8bdc47eb`. One digest pins one architecture's
+  ZIP, so on mixed-architecture fleets either drop `strictSources` (the lock still pins the first
+  observed digest per node) or split per-architecture documents under `serviceScope: document`. Every
+  release lists the digests of its assets on the release page, so a version bump is a matter of copying
+  the new digest for the architecture you deploy.
 - Do not add `--dev` equivalents here: leaving `WEBCAM_DEV` unset keeps authentication enabled, which is
   required in production.
 - The camera plane is exposed under the same prefix, so a camera connects to
