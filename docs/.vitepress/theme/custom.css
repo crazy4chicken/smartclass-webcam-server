@@ -1,0 +1,62 @@
+/* HTTP method badges in generated API reference headings (Scalar-style). */
+
+.http-method {
+  display: inline-block;
+  padding: 1px 8px;
+  border-radius: 6px;
+  font-family: var(--vp-font-family-mono);
+  font-size: 0.82em;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  vertical-align: middle;
+}
+
+.http-get {
+  color: #0eac5b;
+  background-color: rgba(14, 172, 91, 0.12);
+}
+
+.http-post {
+  color: #3b82f6;
+  background-color: rgba(59, 130, 246, 0.12);
+}
+
+.http-put {
+  color: #d97706;
+  background-color: rgba(217, 119, 6, 0.12);
+}
+
+.http-patch {
+  color: #a855f7;
+  background-color: rgba(168, 85, 247, 0.12);
+}
+
+.http-delete {
+  color: #ef4444;
+  background-color: rgba(239, 68, 68, 0.12);
+}
+
+.dark .http-get {
+  color: #34d399;
+  background-color: rgba(52, 211, 153, 0.15);
+}
+
+.dark .http-post {
+  color: #60a5fa;
+  background-color: rgba(96, 165, 250, 0.15);
+}
+
+.dark .http-put {
+  color: #fbbf24;
+  background-color: rgba(251, 191, 36, 0.15);
+}
+
+.dark .http-patch {
+  color: #c084fc;
+  background-color: rgba(192, 132, 252, 0.15);
+}
+
+.dark .http-delete {
+  color: #f87171;
+  background-color: rgba(248, 113, 113, 0.15);
+}

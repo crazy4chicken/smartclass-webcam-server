@@ -1,0 +1,20 @@
+# Signing keys and service state — never commit private key material.
+data/
+
+# Build output
+/webcam-server
+/webcam-server.exe
+/teamusers.exe
+/filehouse.exe
+
+# Docs site
+node_modules/
+docs/.vitepress/dist/
+docs/.vitepress/cache/
+docs/public/openapi.yaml
+
+# Local tooling
+*.local
+.env
+.env.*
+!.env.example
