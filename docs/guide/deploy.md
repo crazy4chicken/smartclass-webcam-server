@@ -14,7 +14,9 @@ run their own host management.
 - **PostgreSQL 16 or newer.** The service owns one database and applies its embedded schema migrations on
   every startup, so no external migration tool is required.
 - **A teamusers IAM instance.** Operators sign in there, and the service validates every management call
-  against it. The service keeps no local accounts and never stores user passwords.
+  against it. The service keeps no local accounts and never stores user passwords. The `cam:read`,
+  `cam:manage`, and `cam:control` keys must be registered in its catalog; see
+  [Permissions and access control](/guide/permissions).
 - **Object storage.** Either [nsc-filehouse](https://github.com/crazy4chicken/nsc-filehouse) or any
   S3-compatible endpoint (MinIO, Ceph, or a cloud S3 service). The filehouse bucket must already exist;
   the S3 bucket is created on startup when missing. When no storage is configured the service still
@@ -45,9 +47,10 @@ The service reads all configuration from environment variables.
 | `WEBCAM_DB_URL` | - | Yes | PostgreSQL connection string. |
 | `WEBCAM_TEAMUSERS_URL` | - | Yes | Base URL of the teamusers service. Not required when `WEBCAM_DEV=true`. |
 | `WEBCAM_TEAMUSERS_AUD` | `teamusers` | No | Expected JWT audience. It must match the issuer's `TEAMUSERS_TOKEN_AUDIENCE`. |
-| `WEBCAM_TEAMUSERS_CLIENT_ID` | - | Conditional | teamusers service credential ID. Required when filehouse storage is used; with the secret below it is also the recommended way to authorize permission checks. |
-| `WEBCAM_TEAMUSERS_CLIENT_SECRET` | - | Conditional | teamusers service credential secret. Treat as a secret. |
-| `WEBCAM_TEAMUSERS_SVC_TOKEN` | - | No | Static teamusers service token, used only when no client credentials are set. It expires after ten minutes, so prefer client credentials. |
+| `WEBCAM_TEAMUSERS_CLIENT_ID` | - | Conditional | teamusers service credential ID. Required for filehouse storage; with the secret below it is also the recommended way to authorize permission checks. |
+| `WEBCAM_TEAMUSERS_CLIENT_SECRET` | - | Conditional | teamusers service credential secret. Required together with the ID (filehouse storage needs both). Treat as a secret. |
+| `WEBCAM_TEAMUSERS_SVC_TOKEN` | - | No | Static teamusers service token, used for permission checks only when no client credentials are set. It expires after ten minutes, so prefer client credentials. |
+| `WEBCAM_WS_TICKET_TTL` | `60s` | No | Lifetime of a device registration ticket issued by `GET /ws/register`. Go duration syntax. |
 | `WEBCAM_FILEHOUSE_URL` | - | Conditional | nsc-filehouse base URL. Setting it selects filehouse storage. |
 | `WEBCAM_FILEHOUSE_BUCKET` | `webcam-segments` | No | Filehouse bucket for segments. It must exist before startup. |
 | `WEBCAM_S3_ENDPOINT` | `localhost:9000` | No | S3-compatible endpoint as `host:port`. |
@@ -55,7 +58,7 @@ The service reads all configuration from environment variables.
 | `WEBCAM_S3_SECRET_KEY` | - | No | S3 secret key. Treat as a secret. |
 | `WEBCAM_S3_BUCKET` | `webcam-streams` | No | S3 bucket for segments. Created on startup when missing. |
 | `WEBCAM_S3_USE_SSL` | `false` | No | Use TLS for the object storage connection. |
-| `WEBCAM_DEV` | `false` | No | Disables authentication entirely with a synthetic subject. Local development only; never enable in production. |
+| `WEBCAM_DEV` | `false` | No | Disables authentication entirely with a synthetic subject; every request is treated as `any`-scoped. Local development only; never enable in production. |
 
 Storage backend precedence: nsc-filehouse when `WEBCAM_FILEHOUSE_URL` is set, otherwise S3 when
 `WEBCAM_S3_ACCESS_KEY` is set, otherwise a discarding no-op backend.
@@ -86,14 +89,15 @@ Security notes:
      the service account access to it. The service does not create filehouse buckets.
    - S3-compatible: supply credentials; the service creates the bucket on startup if it is missing.
 
-3. **Register the permission in teamusers.** Add the `webcam:cameras:any` permission to the teamusers
-   permission catalog and bind it to the role that operators hold. Without this binding every
-   `/api` request is rejected.
+3. **Register the permissions in teamusers.** Add the nine keys (or the `cam:<action>:*` wildcards)
+   to the teamusers permission catalog and bind them to the roles that operators hold. Without a
+   binding every `/api` request is rejected. The [Permissions guide](/guide/permissions) has the
+   registration snippet, the key grammar, and role examples.
 
-4. **Create the service credential.** In teamusers, create a service credential for this service and note
-   its `client_id` and `client_secret`; set them as `WEBCAM_TEAMUSERS_CLIENT_ID` and
-   `WEBCAM_TEAMUSERS_CLIENT_SECRET`. The same credential authenticates the filehouse backend call that
-   produces segment download links.
+4. **Create the service credential.** In teamusers, create a service credential for this service and set
+   its `client_id` and `client_secret` as `WEBCAM_TEAMUSERS_CLIENT_ID` and
+   `WEBCAM_TEAMUSERS_CLIENT_SECRET` (both are required for filehouse storage). The
+   [Permissions guide](/guide/permissions#service-credential) describes what the credential authorizes.
 
 5. **Start the service** and confirm `GET /healthz` answers.
 
@@ -133,7 +137,7 @@ services:
       timeout: 5s
     route:
       prefix: /webcam
-      strip: true # /webcam/api/cameras reaches the child as /api/cameras
+      strip: true # /webcam/api/devices reaches the child as /api/devices
 ```
 
 Notes:
@@ -151,8 +155,9 @@ Notes:
   the new digest for the architecture you deploy.
 - Do not add `--dev` equivalents here: leaving `WEBCAM_DEV` unset keeps authentication enabled, which is
   required in production.
-- The camera plane is exposed under the same prefix, so a camera connects to
-  `wss://<host>/webcam/ws/camera/<id>?token=<teamusers access token>`.
+- The device plane is exposed under the same prefix: a device registers over
+  `https://<host>/webcam/ws/register` with its device token, then upgrades
+  `wss://<host>/webcam/ws/device/<device_websocket_id>`.
 - The service CWD is the svchost service root, not the artifact directory. This service keeps no state on
   disk, so no path configuration is needed.
 
@@ -195,17 +200,18 @@ The service speaks plain HTTP and does not terminate TLS. Terminate TLS at the e
 plain HTTP over the trusted internal network. The proxy must:
 
 - forward the `Authorization` header unchanged, because every `/api` request is authorized with a
-  teamusers bearer token;
-- forward WebSocket upgrades (`Upgrade` and `Connection` headers) for the camera plane at
-  `/ws/camera/{id}`, and allow long-lived connections there;
-- preserve the query string, since cameras authenticate with `?token=<teamusers access token>`;
+  teamusers bearer token and every device authenticates with its device token;
+- forward GET requests with a JSON body unchanged: device registration is a `GET /ws/register` whose
+  body carries the camera list, and a proxy must not drop bodies on GET;
+- forward WebSocket upgrades (`Upgrade` and `Connection` headers) for the device plane at
+  `/ws/device/{device_websocket_id}`, and allow long-lived connections there;
 - route `/webcam/*` to the service when using an external prefix, or expose the service at the root.
 
 ## Operations
 
 - **Health.** `GET /healthz` returns `200 {"status":"ok"}` without touching the database; use it as the
-  liveness and startup probe. `GET /readyz` returns `200 {"status":"ready"}` once the database is
-  reachable and `503` otherwise; use it for database-readiness gating.
+  liveness and startup probe. `GET /readyz` returns `200 {"status":"ready"}` while the HTTP server
+  serves requests; it does not probe the database, so gate on your database monitoring separately.
 - **Logs.** The service writes structured JSON records to stdout and logs nothing to disk. Nekostick
   captures child stdout/stderr line by line; under systemd use `journalctl -u smartclass-webcam-server`.
   Never log or forward the connection string, client secret, or access tokens.
@@ -213,7 +219,14 @@ plain HTTP over the trusted internal network. The proxy must:
   to 30 seconds before exiting. Nekostick provides a 15-second grace period, so give it a longer one
   (the systemd unit above uses 40 seconds) if the proxy needs to drain first.
 - **Credential rotation.** To rotate the teamusers client secret, create a new credential in teamusers,
-  update `WEBCAM_TEAMUSERS_CLIENT_SECRET` in the deployment, and restart the service; the new credential
-  is used for both API authorization and filehouse access. Remove the old credential after the restart.
-  When `WEBCAM_TEAMUSERS_CLIENT_ID` and `WEBCAM_TEAMUSERS_CLIENT_SECRET` are both set they take
-  precedence over `WEBCAM_TEAMUSERS_SVC_TOKEN`.
+  update `WEBCAM_TEAMUSERS_CLIENT_SECRET` in the deployment, and restart the service; remove the old
+  credential after the restart. The [Permissions guide](/guide/permissions#service-credential) describes
+  what the credential authorizes and how it relates to `WEBCAM_TEAMUSERS_SVC_TOKEN`.
+- **Device credentials.** A device token is issued once when the device is created
+  (`POST /api/devices`) and rotated with `POST /api/devices/{device_id}/token`. Rotation invalidates
+  the old token, drops the device's pending registration ticket, and closes its live connection, so
+  the device agent must be reconfigured and register again. Deleting a device
+  (`DELETE /api/devices/{device_id}/`) removes its sessions, segments, and photo records with it and
+  stops the token from working. A token is never recoverable; store the device id and token where the
+  agent can read them. See the [Device registration](/protocol/registration) reference for the
+  registration steps.

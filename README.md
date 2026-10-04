@@ -1,68 +1,39 @@
 # SmartClass Webcam Server
 
-SmartClass Webcam Server is a self-hosted backend for classroom camera fleets. Cameras connect over an
-authenticated WebSocket, operators manage cameras and recordings from a single REST API, and every
+SmartClass Webcam Server is a self-hosted backend for classroom camera fleets. Each classroom device
+registers over HTTP with a long-lived device token, holds an authenticated WebSocket that carries
+control commands and media, operators manage devices and recordings from a single REST API, and every
 recording is kept in the object storage your organisation already runs.
 
 ## Capabilities
 
-- **Camera registry and live status.** Register each camera with a name, location, and capture profile,
-  and see whether it is online, idle, or recording.
-- **Remote camera control.** Apply configuration changes and start or stop recordings from the API, with
-  no visit to the classroom.
-- **Recording sessions with playable segments.** Every recording is a session with its own ordered
-  segment list, downloadable on demand for playback or archiving.
-- **Storage where you want it.** Recordings go to [nsc-filehouse](https://github.com/crazy4chicken/nsc-filehouse),
-  the fleet's object storage service, or to any S3-compatible endpoint.
-- **Enterprise sign-in and permissions.** Operator accounts live in
-  [teamusers](https://github.com/crazy4chicken/nsc-teamusers); the service keeps no local accounts and
-  checks every management call against the `webcam:cameras:any` permission.
-- **Metadata you control.** Camera, session, and segment metadata stays in your own PostgreSQL database.
+Device registry with live status, remote camera control, recording sessions with playable
+segments, storage in nsc-filehouse or any S3-compatible endpoint, teamusers-based permissions, and
+metadata in your own PostgreSQL. Each capability is described on the
+[documentation home](https://crazy4chicken.github.io/smartclass-webcam-server/).
 
 ## Quick start
 
-Prerequisites:
-
-- Go 1.26 or newer to build the service.
-- PostgreSQL 16 or newer.
-- A teamusers instance that signs operators in.
-- nsc-filehouse or an S3-compatible object store for recordings.
-
-Set the required configuration and storage target:
-
-```sh
-export WEBCAM_DB_URL='postgres://<user>:<password>@127.0.0.1:5432/webcam?sslmode=disable'
-export WEBCAM_TEAMUSERS_URL='http://127.0.0.1:8081'
-export WEBCAM_TEAMUSERS_CLIENT_ID='smartclass-webcam-server'
-export WEBCAM_TEAMUSERS_CLIENT_SECRET='<teamusers client secret>'
-export WEBCAM_FILEHOUSE_URL='http://127.0.0.1:8082'
-export WEBCAM_FILEHOUSE_BUCKET='webcam-segments'
-```
-
-Using S3 instead of nsc-filehouse? Set `WEBCAM_S3_ENDPOINT`, `WEBCAM_S3_ACCESS_KEY`, and
-`WEBCAM_S3_SECRET_KEY` (optionally `WEBCAM_S3_BUCKET` and `WEBCAM_S3_USE_SSL`) and leave the filehouse
-variables unset.
-
-Build, run, and check the service:
-
-```sh
-go build -o smartclass-webcam-server ./cmd/server
-./smartclass-webcam-server
-curl -fsS http://127.0.0.1:8080/healthz
-```
-
-The service applies its database schema automatically on startup. See the deployment guide for creating
-the database, the storage bucket, and the teamusers permission and credential.
+A local run needs Go 1.26+, PostgreSQL 16+, a teamusers instance, and a filehouse or
+S3-compatible bucket; the service applies its database schema on startup. The
+[getting started guide](https://crazy4chicken.github.io/smartclass-webcam-server/guide/getting-started)
+covers the database and bucket, the required `WEBCAM_*` configuration, building and running, and
+the first recording.
 
 ## Documentation
 
-- [Deployment guide](docs/guide/deploy.md) - prerequisites, configuration reference, svchost compose example,
-  systemd unit, TLS, and operations.
-  Published at <https://crazy4chicken.github.io/smartclass-webcam-server/guide/deploy>.
-- [API reference](https://crazy4chicken.github.io/smartclass-webcam-server/api/overview) - the management
-  endpoints and the camera WebSocket protocol.
 - [Getting started](https://crazy4chicken.github.io/smartclass-webcam-server/guide/getting-started) - a
   full walkthrough from an empty database to a first recording.
+- [Device protocol](https://crazy4chicken.github.io/smartclass-webcam-server/protocol/) -
+  the authoritative device contract: registration, ticket lifecycle, framing, and every command.
+- [Permissions and access control](https://crazy4chicken.github.io/smartclass-webcam-server/guide/permissions) -
+  the `cam:<action>:<scope>` permissions, the scope ladder, and teamusers catalog registration.
+- [Service integration](https://crazy4chicken.github.io/smartclass-webcam-server/guide/service-integration) -
+  how other services retrieve recordings and photos: discovery, presigned downloads, and direct bucket access.
+- [Deployment guide](https://crazy4chicken.github.io/smartclass-webcam-server/guide/deploy) - prerequisites,
+  configuration reference, svchost compose example, systemd unit, TLS, and operations.
+- [API reference](https://crazy4chicken.github.io/smartclass-webcam-server/api/overview) - the management
+  endpoints and the device WebSocket protocol.
 
 ## License
 

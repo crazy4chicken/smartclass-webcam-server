@@ -11,6 +11,7 @@ export default defineConfig({
   themeConfig: {
     nav: [
       { text: 'Guide', link: '/guide/getting-started' },
+      { text: 'Protocol', link: '/protocol/' },
       { text: 'Deployment', link: '/guide/deploy' },
       { text: 'API Reference', link: '/api/overview' },
       {
@@ -24,7 +25,21 @@ export default defineConfig({
           text: 'Guide',
           items: [
             { text: 'Getting Started', link: '/guide/getting-started' },
-            { text: 'Deployment', link: '/guide/deploy' }
+            { text: 'Permissions', link: '/guide/permissions' },
+            { text: 'Deployment', link: '/guide/deploy' },
+            { text: 'Service Integration', link: '/guide/service-integration' }
+          ]
+        }
+      ],
+      '/protocol/': [
+        {
+          text: 'Device Protocol',
+          items: [
+            { text: 'Overview', link: '/protocol/' },
+            { text: 'Registration', link: '/protocol/registration' },
+            { text: 'WebSocket Transport', link: '/protocol/transport' },
+            { text: 'Control Channel', link: '/protocol/control' },
+            { text: 'Media Channels', link: '/protocol/media' }
           ]
         }
       ],
@@ -33,8 +48,9 @@ export default defineConfig({
           text: 'API Reference',
           items: [
             { text: 'Overview', link: '/api/overview' },
-            { text: 'Cameras', link: '/api/reference/cameras' },
+            { text: 'Devices', link: '/api/reference/devices' },
             { text: 'Streams', link: '/api/reference/streams' },
+            { text: 'Photos', link: '/api/reference/photos' },
             { text: 'WebSocket', link: '/api/reference/websocket' },
             { text: 'Health', link: '/api/reference/health' },
             // Static file, not a route: VitePress leaves its URL untouched,
