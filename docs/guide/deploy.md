@@ -114,9 +114,9 @@ services:
     source:
       # Pushing a v* tag publishes smartclass-webcam-server_<version>_<arch>.zip
       # release assets through the release workflow.
-      release: "github:crazy4chicken/smartclass-webcam-server@v0.1.0"
-      # SHA-256 of smartclass-webcam-server_0.1.0_x64.zip.
-      sha256: "eb52e6723e71fd9c3d118978db63c9e21d291b25346f74f33866c033de1a2019"
+      release: "github:crazy4chicken/smartclass-webcam-server@v0.2.0"
+      # SHA-256 of smartclass-webcam-server_0.2.0_x64.zip.
+      sha256: "736d17eac5f296ff4acf2eab7fc81717f9fe49d738ad1aaf11ef6b983c8a35f9"
     env:
       # The host injects HOST and PORT for every launch. This service does not
       # read PORT itself: WEBCAM_LISTEN_ADDR is the only listen setting, and it
