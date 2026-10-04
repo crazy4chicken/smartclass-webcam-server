@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
-	"sync"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
@@ -21,9 +20,6 @@ import (
 )
 
 const (
-	// camerasManagePermission guards every management route under /api.
-	camerasManagePermission = "webcam:cameras:any"
-
 	// jsonContentType is the content type of regular JSON responses.
 	jsonContentType = "application/json; charset=utf-8"
 
@@ -34,27 +30,30 @@ const (
 	maxRequestBody = 1 << 20
 )
 
-// server holds the dependencies shared by the HTTP handlers.
-type server struct {
-	auth               *auth.Auth
-	store              *store.Store
-	hub                *ws.Hub
-	storage            storage.ObjectStorage
-	streamAccumulators map[string]*frameAccumulator // streamID → accumulator
-	accMu              sync.Mutex
+// Server holds the dependencies shared by the HTTP handlers.
+type Server struct {
+	auth     *auth.Auth
+	store    *store.Store
+	hub      *ws.Hub
+	registry *ws.Registry
+	objects  storage.ObjectStorage
+	media    *mediaManager
 }
 
 // NewRouter builds the HTTP router for the webcam server.
 //
-// Health endpoints and the camera WebSocket endpoint are public; every route
-// under /api requires a verified Bearer token carrying camerasManagePermission.
-func NewRouter(auth *auth.Auth, store *store.Store, hub *ws.Hub, storage storage.ObjectStorage) chi.Router {
-	s := &server{
-		auth:               auth,
-		store:              store,
-		hub:                hub,
-		storage:            storage,
-		streamAccumulators: make(map[string]*frameAccumulator),
+// Health probes and the device WebSocket endpoints are public; /ws/register
+// authenticates the device with its own long-lived token. Every route under
+// /api requires a verified Bearer token and authorizes a cam:<action>:<scope>
+// permission resolved against the device by RequireCollection or RequireDevice.
+func NewRouter(authn *auth.Auth, st *store.Store, hub *ws.Hub, registry *ws.Registry, objects storage.ObjectStorage) *chi.Mux {
+	s := &Server{
+		auth:     authn,
+		store:    st,
+		hub:      hub,
+		registry: registry,
+		objects:  objects,
+		media:    newMediaManager(st, objects, registry, hub),
 	}
 
 	r := chi.NewRouter()
@@ -73,34 +72,39 @@ func NewRouter(auth *auth.Auth, store *store.Store, hub *ws.Hub, storage storage
 	r.Get("/healthz", s.handleHealthz)
 	r.Get("/readyz", s.handleReadyz)
 
+	// The device plane registers over HTTP with its device token, then redeems
+	// the returned single-use ticket on the WebSocket route.
+	r.Get("/ws/register", s.handleDeviceRegister)
+	r.Get("/ws/device/{device_websocket_id}", s.handleDeviceWS)
+
 	r.Route("/api", func(r chi.Router) {
-		// Middleware verifies Bearer tokens when present; Require rejects
-		// requests without verified claims and authorizes the permission.
+		// Middleware verifies Bearer tokens when present; the per-route
+		// RequireCollection and RequireDevice middleware below enforce the
+		// cam:<action>:<scope> permission of each route.
 		r.Use(s.auth.Middleware())
-		r.Use(s.auth.Require(camerasManagePermission, nil))
 
-		r.Get("/cameras", s.listCameras)
-		r.Post("/cameras", s.createCamera)
+		r.With(s.auth.RequireCollection("read")).Get("/devices", s.handleDeviceList)
+		r.With(s.auth.RequireCollection("manage")).Post("/devices", s.handleDeviceCreate)
 
-		r.Route("/cameras/{id}", func(r chi.Router) {
-			r.Get("/", s.getCamera)
-			r.Put("/", s.updateCamera)
-			r.Delete("/", s.deleteCamera)
-			r.Post("/configure", s.configureCamera)
-			r.Post("/stream/start", s.startStream)
-			r.Post("/stream/stop", s.stopStream)
-			r.Get("/streams", s.listStreams)
+		r.Route("/devices/{device_id}", func(r chi.Router) {
+			r.With(s.auth.RequireDevice("read", s.loadDeviceFromPath)).Get("/", s.handleDeviceGet)
+			r.With(s.auth.RequireDevice("manage", s.loadDeviceFromPath)).Put("/", s.handleDeviceUpdate)
+			r.With(s.auth.RequireDevice("manage", s.loadDeviceFromPath)).Delete("/", s.handleDeviceDelete)
+			r.With(s.auth.RequireDevice("manage", s.loadDeviceFromPath)).Post("/token", s.handleDeviceTokenRotate)
+
+			r.With(s.auth.RequireDevice("control", s.loadDeviceFromPath)).Post("/camera/switch", s.handleCameraSwitch)
+			r.With(s.auth.RequireDevice("control", s.loadDeviceFromPath)).Post("/recording/start", s.handleRecordingStart)
+			r.With(s.auth.RequireDevice("control", s.loadDeviceFromPath)).Post("/recording/stop", s.handleRecordingStop)
+			r.With(s.auth.RequireDevice("control", s.loadDeviceFromPath)).Post("/photo", s.handlePhotoCapture)
+
+			r.With(s.auth.RequireDevice("read", s.loadDeviceFromPath)).Get("/streams", s.handleDeviceStreams)
+			r.With(s.auth.RequireDevice("read", s.loadDeviceFromPath)).Get("/photos", s.handleDevicePhotos)
 		})
 
-		r.Route("/streams/{id}", func(r chi.Router) {
-			r.Get("/", s.getStream)
-			r.Get("/segments", s.listSegments)
-		})
+		r.With(s.auth.RequireDevice("read", s.loadDeviceFromStream)).Get("/streams/{stream_id}/", s.handleStreamGet)
+		r.With(s.auth.RequireDevice("read", s.loadDeviceFromStream)).Get("/streams/{stream_id}/segments", s.handleStreamSegments)
+		r.With(s.auth.RequireDevice("read", s.loadDeviceFromPhoto)).Get("/photos/{photo_id}/", s.handlePhotoGet)
 	})
-
-	// Camera WebSocket endpoint. The upgrade request carries its access token
-	// in the token query parameter, which the handler verifies.
-	r.Get("/ws/camera/{id}", s.handleCameraWS)
 
 	return r
 }
@@ -111,12 +115,12 @@ type statusResponse struct {
 }
 
 // handleHealthz handles GET /healthz.
-func (s *server) handleHealthz(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, statusResponse{Status: "ok"})
 }
 
 // handleReadyz handles GET /readyz.
-func (s *server) handleReadyz(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, statusResponse{Status: "ready"})
 }
 

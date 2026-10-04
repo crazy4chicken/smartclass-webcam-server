@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"time"
 )
 
 // Config holds all server configuration.
@@ -23,6 +24,7 @@ type Config struct {
 	TeamusersSecret   string
 	FilehouseURL      string
 	FilehouseBucket   string
+	WSTicketTTL       time.Duration
 	DevMode           bool
 }
 
@@ -54,6 +56,11 @@ func Load() (*Config, error) {
 	cfg.S3UseSSL, err = strconv.ParseBool(sslStr)
 	if err != nil {
 		return nil, fmt.Errorf("WEBCAM_S3_USE_SSL: %w", err)
+	}
+
+	cfg.WSTicketTTL, err = time.ParseDuration(envOrDefault("WEBCAM_WS_TICKET_TTL", "60s"))
+	if err != nil {
+		return nil, fmt.Errorf("WEBCAM_WS_TICKET_TTL: %w", err)
 	}
 
 	if cfg.DBURL == "" {

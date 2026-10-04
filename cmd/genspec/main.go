@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	apidocs "github.com/crazy4chicken/nsc-teamusers/apidocs/go"
 
@@ -27,7 +28,7 @@ func main() {
 func generate() error {
 	// chi.Walk only inspects route patterns, so the router is built with inert
 	// stubs: no database or network connection is opened at generation time.
-	router := httpapi.NewRouter(auth.NewDevAuth(), store.New(nil), ws.NewHub(), storage.NoopStorage{})
+	router := httpapi.NewRouter(auth.NewDevAuth(), store.New(nil), ws.NewHub(), ws.NewRegistry(60*time.Second), storage.NoopStorage{})
 
 	operations, err := apidocs.Collect(router, httpapi.DocOperations, httpapi.DocPermissionDeriver)
 	if err != nil {

@@ -5,35 +5,42 @@
 //
 // Public endpoints:
 //
-//	GET /healthz   liveness probe
-//	GET /readyz    readiness probe
+//	GET /healthz                          liveness probe
+//	GET /readyz                           readiness probe
+//	GET /ws/register                      register a device and issue a WebSocket ticket
+//	GET /ws/device/{device_websocket_id}  upgrade the device WebSocket
 //
-// Management endpoints under /api require a teamusers Bearer token carrying the
-// webcam:cameras:any permission (401 without verified claims, 403 when denied):
+// Management endpoints under /api require a teamusers Bearer token carrying a
+// cam:read, cam:manage or cam:control permission scoped to own, team or any
+// (401 without verified claims, 403 when denied):
 //
-//	GET    /api/cameras                    list cameras
-//	POST   /api/cameras                    register a camera
-//	GET    /api/cameras/{id}               fetch one camera
-//	PUT    /api/cameras/{id}               update camera fields
-//	DELETE /api/cameras/{id}               delete a camera and its streams
-//	POST   /api/cameras/{id}/configure     push a configuration to a camera
-//	POST   /api/cameras/{id}/stream/start  start a recording stream
-//	POST   /api/cameras/{id}/stream/stop   stop the active stream
-//	GET    /api/cameras/{id}/streams       list a camera's streams
-//	GET    /api/streams/{id}               fetch a stream with its segments
-//	GET    /api/streams/{id}/segments      list a stream's segments
+//	GET    /api/devices                          list devices
+//	POST   /api/devices                          register a device and issue its token
+//	GET    /api/devices/{device_id}/             fetch one device with its live cameras
+//	PUT    /api/devices/{device_id}/             update device fields
+//	DELETE /api/devices/{device_id}/             delete a device
+//	POST   /api/devices/{device_id}/token        rotate the device token
+//	POST   /api/devices/{device_id}/camera/switch      switch the active camera
+//	POST   /api/devices/{device_id}/recording/start    start a recording stream
+//	POST   /api/devices/{device_id}/recording/stop     stop the active stream
+//	POST   /api/devices/{device_id}/photo              capture a still image
+//	GET    /api/devices/{device_id}/streams      list a device's streams
+//	GET    /api/devices/{device_id}/photos       list a device's photos
+//	GET    /api/streams/{stream_id}/             fetch a stream with its segments
+//	GET    /api/streams/{stream_id}/segments     list a stream's segments
+//	GET    /api/photos/{photo_id}/               fetch a photo
 //
-// Camera devices connect over WebSocket, authenticating with an access token in
-// the token query parameter:
-//
-//	GET /ws/camera/{id}?token=<access token>
+// The device plane authenticates with its own long-lived token on GET
+// /ws/register; the returned device_websocket_id is a single-use ticket for GET
+// /ws/device/{device_websocket_id}, which then carries the control, recording
+// and photo channels of the WebSocket protocol.
 //
 // # Responses
 //
 // Collection endpoints return {"items": [...]}. Single-resource endpoints
 // return the resource object itself. Errors use RFC 9457 problem details
-// (application/problem+json) with type "about:blank"; 401 and 403 responses
-// emitted by the teamusers middleware use the SDK's own
+// (application/problem+json) with type "about:blank"; the missing-claims 401
+// emitted by the teamusers middleware uses the SDK's own
 // {"allow": false, "reason": ...} shape instead.
 //
 // DocOperations lists every route together with its request and response
@@ -48,17 +55,115 @@ import (
 	apidocs "github.com/crazy4chicken/nsc-teamusers/apidocs/go"
 
 	"github.com/crazy4chicken/smartclass-webcam-server/internal/domain"
+	"github.com/crazy4chicken/smartclass-webcam-server/internal/ws"
 )
 
-// DocPermissionDeriver returns the permission that guards method and path for
-// the generated reference. Every route under /api is covered by the single
-// management permission; health and camera WebSocket routes are public and
-// therefore carry no permission line.
-func DocPermissionDeriver(_, path string) (anyKey, teamKey string) {
-	if strings.HasPrefix(path, "/api/") {
-		return camerasManagePermission, ""
+// DocPermissionDeriver returns the cam:<action>:any and cam:<action>:team keys
+// that guard method and path for the generated reference. The own-scoped key
+// depends on the caller and the device, so it cannot be derived statically and
+// is documented in the guide only. Health and device-plane routes are public
+// and therefore carry no permission line.
+func DocPermissionDeriver(method, path string) (anyKey, teamKey string) {
+	var action string
+	switch path {
+	case "/api/devices":
+		if method == "POST" {
+			action = "manage"
+		} else {
+			action = "read"
+		}
+	case "/api/devices/{device_id}/":
+		if method == "PUT" || method == "DELETE" {
+			action = "manage"
+		} else {
+			action = "read"
+		}
+	case "/api/devices/{device_id}/token":
+		action = "manage"
+	case "/api/devices/{device_id}/camera/switch",
+		"/api/devices/{device_id}/recording/start",
+		"/api/devices/{device_id}/recording/stop",
+		"/api/devices/{device_id}/photo":
+		action = "control"
+	case "/api/devices/{device_id}/streams",
+		"/api/devices/{device_id}/photos",
+		"/api/streams/{stream_id}/",
+		"/api/streams/{stream_id}/segments",
+		"/api/photos/{photo_id}/":
+		action = "read"
+	default:
+		return "", ""
 	}
-	return "", ""
+	return "cam:" + action + ":any", "cam:" + action + ":team"
+}
+
+// docDeviceDetail mirrors deviceDetail with the embedded device flattened, so
+// the reflected schema matches the JSON body the handler writes.
+type docDeviceDetail struct {
+	ID        string                `json:"id"`
+	Name      string                `json:"name"`
+	Location  string                `json:"location,omitempty"`
+	TeamID    string                `json:"team_id,omitempty"`
+	OwnerID   string                `json:"owner_id,omitempty"`
+	LastSeen  *time.Time            `json:"last_seen,omitempty"`
+	CreatedAt time.Time             `json:"created_at"`
+	UpdatedAt time.Time             `json:"updated_at"`
+	Online    bool                  `json:"online"`
+	Cameras   []ws.CameraCapability `json:"cameras"`
+}
+
+// docDeviceToken mirrors the creation and rotation envelope, which carries the
+// device together with its plaintext token.
+type docDeviceToken struct {
+	Device domain.Device `json:"device"`
+	Token  string        `json:"token"`
+}
+
+// docDeviceCreateRequest mirrors the device creation body.
+type docDeviceCreateRequest struct {
+	Name     string  `json:"name"`
+	Location string  `json:"location,omitempty"`
+	TeamID   *string `json:"team_id,omitempty"`
+	OwnerID  *string `json:"owner_id,omitempty"`
+}
+
+// docDeviceUpdateRequest mirrors the partial device update body.
+type docDeviceUpdateRequest struct {
+	Name     *string `json:"name,omitempty"`
+	Location *string `json:"location,omitempty"`
+	TeamID   *string `json:"team_id,omitempty"`
+	OwnerID  *string `json:"owner_id,omitempty"`
+}
+
+// docCameraCommandRequest mirrors the body shared by the four command routes.
+type docCameraCommandRequest struct {
+	CameraEnum *int `json:"camera_enum"`
+}
+
+// docSwitchAccepted mirrors the 202 body of the camera switch command.
+type docSwitchAccepted struct {
+	CommandID  string `json:"command_id"`
+	CameraEnum int    `json:"camera_enum"`
+}
+
+// docPhotoAccepted mirrors the 202 body of the photo command.
+type docPhotoAccepted struct {
+	CommandID  string `json:"command_id"`
+	CameraEnum int    `json:"camera_enum"`
+	RequestID  string `json:"request_id"`
+}
+
+// docRegisterRequest mirrors the JSON body of the device registration call.
+type docRegisterRequest struct {
+	DeviceID string                `json:"device_id"`
+	Cameras  []ws.CameraCapability `json:"cameras"`
+}
+
+// docRegisterResponse mirrors the ticket returned by device registration.
+type docRegisterResponse struct {
+	DeviceWebsocketID string    `json:"device_websocket_id"`
+	ExpiresAt         time.Time `json:"expires_at"`
+	WebsocketPath     string    `json:"websocket_path"`
 }
 
 // docSegmentWithURL mirrors segmentWithURL with the embedded segment flattened,
@@ -66,11 +171,11 @@ func DocPermissionDeriver(_, path string) (anyKey, teamKey string) {
 type docSegmentWithURL struct {
 	ID          string    `json:"id"`
 	StreamID    string    `json:"stream_id"`
-	CameraID    string    `json:"camera_id"`
+	DeviceID    string    `json:"device_id"`
+	CameraEnum  int       `json:"camera_enum"`
 	SegmentSeq  int       `json:"segment_seq"`
-	StorageKey  string    `json:"storage_key"`
 	SizeBytes   int64     `json:"size_bytes"`
-	DurationMs  int       `json:"duration_ms,omitempty"`
+	DurationMS  int       `json:"duration_ms,omitempty"`
 	CreatedAt   time.Time `json:"created_at"`
 	DownloadURL string    `json:"download_url,omitempty"`
 }
@@ -78,13 +183,28 @@ type docSegmentWithURL struct {
 // docStreamDetail mirrors streamDetail with the embedded stream flattened, so
 // the reflected schema matches the JSON body the handler writes.
 type docStreamDetail struct {
-	ID        string                `json:"id"`
-	CameraID  string                `json:"camera_id"`
-	Status    domain.StreamStatus   `json:"status"`
-	StartedAt time.Time             `json:"started_at"`
-	EndedAt   *time.Time            `json:"ended_at,omitempty"`
-	Metadata  domain.StreamMetadata `json:"metadata"`
-	Segments  []docSegmentWithURL   `json:"segments"`
+	ID         string                `json:"id"`
+	DeviceID   string                `json:"device_id"`
+	CameraEnum int                   `json:"camera_enum"`
+	Status     domain.StreamStatus   `json:"status"`
+	StartedAt  time.Time             `json:"started_at"`
+	EndedAt    *time.Time            `json:"ended_at,omitempty"`
+	Metadata   domain.StreamMetadata `json:"metadata"`
+	Segments   []docSegmentWithURL   `json:"segments"`
+}
+
+// docPhotoDetail mirrors photoDetail with the embedded photo flattened, so the
+// reflected schema matches the JSON body the handler writes.
+type docPhotoDetail struct {
+	ID          string    `json:"id"`
+	DeviceID    string    `json:"device_id"`
+	CameraEnum  int       `json:"camera_enum"`
+	ContentType string    `json:"content_type"`
+	SizeBytes   int64     `json:"size_bytes"`
+	RequestID   string    `json:"request_id,omitempty"`
+	TakenAt     time.Time `json:"taken_at"`
+	CreatedAt   time.Time `json:"created_at"`
+	DownloadURL string    `json:"download_url,omitempty"`
 }
 
 // docError builds one documented problem response. The code is rendered as the
@@ -94,80 +214,108 @@ func docError(status int, code, title string) apidocs.ErrorDoc {
 }
 
 var (
-	docInvalidBody     = docError(400, "invalid JSON request body", "Invalid Request")
-	docBodyTooLarge    = docError(413, "request body too large", "Request Entity Too Large")
-	docBadLimit        = docError(400, "limit must be a positive integer", "Invalid Request")
-	docUnauthorized    = docError(401, "authentication failed", "Unauthorized")
-	docForbidden       = docError(403, "insufficient_permissions", "Forbidden")
-	docCameraNotFound  = docError(404, "camera not found", "Not Found")
-	docStreamNotFound  = docError(404, "stream not found", "Not Found")
-	docCameraOffline   = docError(409, "camera is offline", "Conflict")
-	docNotStreaming    = docError(409, "camera is not streaming", "Conflict")
-	docCommandFailed   = docError(502, "camera connection is unavailable", "Bad Gateway")
-	docInternalFailure = docError(500, "internal server error", "Internal Server Error")
+	docInvalidBody       = docError(400, "invalid JSON request body", "Invalid Request")
+	docBodyTooLarge      = docError(413, "request body too large", "Request Entity Too Large")
+	docBadLimit          = docError(400, "limit must be a positive integer", "Invalid Request")
+	docUnauthorized      = docError(401, "authentication failed", "Unauthorized")
+	docDeviceAuthFailed  = docError(401, "device authentication failed", "Unauthorized")
+	docForbidden         = docError(403, "insufficient_permissions", "Forbidden")
+	docDeviceNotFound    = docError(404, "device not found", "Not Found")
+	docStreamNotFound    = docError(404, "stream not found", "Not Found")
+	docPhotoNotFound     = docError(404, "photo not found", "Not Found")
+	docTicketNotFound    = docError(404, "device websocket ticket not found", "Not Found")
+	docTicketReplay      = docError(409, "device websocket ticket is already attached to a live session", "Conflict")
+	docDeviceOffline     = docError(409, "device is offline", "Conflict")
+	docStreamActive      = docError(409, "a stream is already active for this camera", "Conflict")
+	docCommandFailed     = docError(502, "device connection is unavailable", "Bad Gateway")
+	docInternalFailure   = docError(500, "internal server error", "Internal Server Error")
+	docCameraEnumUnknown = docError(400, "camera_enum is not part of the device registration", "Invalid Request")
 )
 
 var (
-	cameraExample = map[string]any{
-		"id":       "01J8Z4W3K5M7Q9R1T3V5X7Z9B1",
-		"name":     "Room 101 front",
-		"location": "Building A / Room 101",
-		"status":   "online",
-		"config": map[string]any{
-			"resolution": "1920x1080",
-			"fps":        30,
-			"codec":      "h264",
-			"bitrate":    4096,
-		},
+	deviceExample = map[string]any{
+		"id":         "01J8Z4W3K5M7Q9R1T3V5X7Z9B1",
+		"name":       "Room 101 device",
+		"location":   "Building A / Room 101",
+		"team_id":    "01J8Z2TEAM5A7C9E1G3J5L7N9P1",
+		"owner_id":   "01J8Z1USER3Y5W7A9C1E3G5J7L9",
 		"last_seen":  "2026-09-30T08:15:04Z",
 		"created_at": "2026-09-01T09:00:00Z",
 		"updated_at": "2026-09-30T08:15:04Z",
 	}
-	updatedCameraExample = map[string]any{
-		"id":       "01J8Z4W3K5M7Q9R1T3V5X7Z9B1",
-		"name":     "Room 101 front (moved)",
-		"location": "Building A / Room 102",
-		"status":   "online",
-		"config": map[string]any{
-			"resolution": "1280x720",
-			"fps":        25,
-			"codec":      "h264",
-			"bitrate":    2048,
-		},
+	updatedDeviceExample = map[string]any{
+		"id":         "01J8Z4W3K5M7Q9R1T3V5X7Z9B1",
+		"name":       "Room 101 device (moved)",
+		"location":   "Building A / Room 102",
+		"team_id":    "01J8Z2TEAM5A7C9E1G3J5L7N9P1",
+		"owner_id":   "01J8Z1USER3Y5W7A9C1E3G5J7L9",
 		"last_seen":  "2026-09-30T08:15:04Z",
 		"created_at": "2026-09-01T09:00:00Z",
 		"updated_at": "2026-09-30T08:16:40Z",
 	}
+	deviceDetailExample = map[string]any{
+		"id":         "01J8Z4W3K5M7Q9R1T3V5X7Z9B1",
+		"name":       "Room 101 device",
+		"location":   "Building A / Room 101",
+		"team_id":    "01J8Z2TEAM5A7C9E1G3J5L7N9P1",
+		"owner_id":   "01J8Z1USER3Y5W7A9C1E3G5J7L9",
+		"last_seen":  "2026-09-30T08:15:04Z",
+		"created_at": "2026-09-01T09:00:00Z",
+		"updated_at": "2026-09-30T08:15:04Z",
+		"online":     true,
+		"cameras": []any{
+			map[string]any{
+				"camera_enum":     0,
+				"resolution":      "1920x1080",
+				"fps":             30,
+				"supported_codec": []any{"h264", "mjpeg"},
+				"attrs":           map[string]any{"label": "front"},
+			},
+			map[string]any{
+				"camera_enum":     1,
+				"resolution":      "1280x720",
+				"fps":             15,
+				"supported_codec": []any{"mjpeg"},
+			},
+		},
+	}
+	deviceTokenExample = map[string]any{
+		"device": deviceExample,
+		"token":  "wdt_9Qm3vT7pX1cR5zB8nK2sD4fG6hJ0lM3aP7uW1yE5iO9qS2tV4xZ6bN8cF0gH2jL4",
+	}
 	streamExample = map[string]any{
-		"id":         "01J8Z5STRM4C8N2P6R0T4V8X2Z6",
-		"camera_id":  "01J8Z4W3K5M7Q9R1T3V5X7Z9B1",
-		"status":     "active",
-		"started_at": "2026-09-30T08:00:00Z",
+		"id":          "01J8Z5STRM4C8N2P6R0T4V8X2Z6",
+		"device_id":   "01J8Z4W3K5M7Q9R1T3V5X7Z9B1",
+		"camera_enum": 0,
+		"status":      "active",
+		"started_at":  "2026-09-30T08:00:00Z",
 		"metadata": map[string]any{
 			"resolution": "1920x1080",
 			"fps":        30,
 			"codec":      "h264",
+			"codecs":     []any{"h264", "mjpeg"},
 		},
 	}
 	completedStreamExample = map[string]any{
-		"id":         "01J8Z7STRM6E0R4T8V2X6Z0B4D8",
-		"camera_id":  "01J8Z4W3K5M7Q9R1T3V5X7Z9B1",
-		"status":     "completed",
-		"started_at": "2026-09-30T07:15:00Z",
-		"ended_at":   "2026-09-30T07:45:00Z",
+		"id":          "01J8Z7STRM6E0R4T8V2X6Z0B4D8",
+		"device_id":   "01J8Z4W3K5M7Q9R1T3V5X7Z9B1",
+		"camera_enum": 1,
+		"status":      "completed",
+		"started_at":  "2026-09-30T07:15:00Z",
+		"ended_at":    "2026-09-30T07:45:00Z",
 		"metadata": map[string]any{
-			"resolution":   "1920x1080",
-			"fps":          30,
-			"codec":        "h264",
-			"total_frames": 54000,
+			"resolution": "1280x720",
+			"fps":        15,
+			"codec":      "mjpeg",
+			"codecs":     []any{"mjpeg"},
 		},
 	}
 	segmentExample = map[string]any{
 		"id":          "01J8Z6SEGM5D9Q3S7U1W5Y9A3C7",
 		"stream_id":   "01J8Z5STRM4C8N2P6R0T4V8X2Z6",
-		"camera_id":   "01J8Z4W3K5M7Q9R1T3V5X7Z9B1",
+		"device_id":   "01J8Z4W3K5M7Q9R1T3V5X7Z9B1",
+		"camera_enum": 0,
 		"segment_seq": 12,
-		"storage_key": "01J8Z4W3K5M7Q9R1T3V5X7Z9B1/01J8Z5STRM4C8N2P6R0T4V8X2Z6/20260930T080112_12.bin",
 		"size_bytes":  1048576,
 		"duration_ms": 6000,
 		"created_at":  "2026-09-30T08:01:12Z",
@@ -175,34 +323,80 @@ var (
 	segmentWithURLExample = map[string]any{
 		"id":           "01J8Z6SEGM5D9Q3S7U1W5Y9A3C7",
 		"stream_id":    "01J8Z5STRM4C8N2P6R0T4V8X2Z6",
-		"camera_id":    "01J8Z4W3K5M7Q9R1T3V5X7Z9B1",
+		"device_id":    "01J8Z4W3K5M7Q9R1T3V5X7Z9B1",
+		"camera_enum":  0,
 		"segment_seq":  12,
-		"storage_key":  "01J8Z4W3K5M7Q9R1T3V5X7Z9B1/01J8Z5STRM4C8N2P6R0T4V8X2Z6/20260930T080112_12.bin",
 		"size_bytes":   1048576,
 		"duration_ms":  6000,
 		"created_at":   "2026-09-30T08:01:12Z",
-		"download_url": "https://filehouse.example.edu/objects/webcam-segments/01J8Z6SEGM5D9Q3S7U1W5Y9A3C7?X-Amz-Expires=900",
+		"download_url": "https://filehouse.example.edu/objects/webcam-segments/01J8Z4W3K5M7Q9R1T3V5X7Z9B1/streams/01J8Z5STRM4C8N2P6R0T4V8X2Z6/20260930T080112_12.bin?X-Amz-Expires=900",
 	}
 	streamDetailExample = map[string]any{
-		"id":         "01J8Z5STRM4C8N2P6R0T4V8X2Z6",
-		"camera_id":  "01J8Z4W3K5M7Q9R1T3V5X7Z9B1",
-		"status":     "active",
-		"started_at": "2026-09-30T08:00:00Z",
+		"id":          "01J8Z5STRM4C8N2P6R0T4V8X2Z6",
+		"device_id":   "01J8Z4W3K5M7Q9R1T3V5X7Z9B1",
+		"camera_enum": 0,
+		"status":      "active",
+		"started_at":  "2026-09-30T08:00:00Z",
 		"metadata": map[string]any{
 			"resolution": "1920x1080",
 			"fps":        30,
 			"codec":      "h264",
+			"codecs":     []any{"h264", "mjpeg"},
 		},
 		"segments": []any{segmentWithURLExample},
 	}
-	configureExample = map[string]any{
-		"camera_id": "01J8Z4W3K5M7Q9R1T3V5X7Z9B1",
-		"config": map[string]any{
-			"resolution": "1280x720",
-			"fps":        25,
-			"codec":      "h264",
-			"bitrate":    2048,
+	photoExample = map[string]any{
+		"id":           "01J8Z8PHOT7F1S5U9W3Y7A1C5E9",
+		"device_id":    "01J8Z4W3K5M7Q9R1T3V5X7Z9B1",
+		"camera_enum":  0,
+		"content_type": "image/jpeg",
+		"size_bytes":   245760,
+		"request_id":   "01J8Z9REQ8G2T6V0X4Z8B2D6F0H4",
+		"taken_at":     "2026-09-30T08:20:00Z",
+		"created_at":   "2026-09-30T08:20:01Z",
+	}
+	photoDetailExample = map[string]any{
+		"id":           "01J8Z8PHOT7F1S5U9W3Y7A1C5E9",
+		"device_id":    "01J8Z4W3K5M7Q9R1T3V5X7Z9B1",
+		"camera_enum":  0,
+		"content_type": "image/jpeg",
+		"size_bytes":   245760,
+		"request_id":   "01J8Z9REQ8G2T6V0X4Z8B2D6F0H4",
+		"taken_at":     "2026-09-30T08:20:00Z",
+		"created_at":   "2026-09-30T08:20:01Z",
+		"download_url": "https://filehouse.example.edu/objects/webcam-segments/01J8Z4W3K5M7Q9R1T3V5X7Z9B1/photos/01J8Z8PHOT7F1S5U9W3Y7A1C5E9?X-Amz-Expires=900",
+	}
+	registerRequestExample = map[string]any{
+		"device_id": "01J8Z4W3K5M7Q9R1T3V5X7Z9B1",
+		"cameras": []any{
+			map[string]any{
+				"camera_enum":     0,
+				"resolution":      "1920x1080",
+				"fps":             30,
+				"supported_codec": []any{"h264", "mjpeg"},
+				"attrs":           map[string]any{"label": "front"},
+			},
+			map[string]any{
+				"camera_enum":     1,
+				"resolution":      "1280x720",
+				"fps":             15,
+				"supported_codec": []any{"mjpeg"},
+			},
 		},
+	}
+	registerResponseExample = map[string]any{
+		"device_websocket_id": "9f2c1d4e5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d",
+		"expires_at":          "2026-10-04T10:01:00Z",
+		"websocket_path":      "/ws/device/9f2c1d4e5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d",
+	}
+	switchAcceptedExample = map[string]any{
+		"command_id":  "01J8ZA2CMD9H3V7Y1B5D9F3J7L1",
+		"camera_enum": 1,
+	}
+	photoAcceptedExample = map[string]any{
+		"command_id":  "01J8ZB4CMD1K5X9A3E7G1J5N9R3",
+		"camera_enum": 0,
+		"request_id":  "01J8Z9REQ8G2T6V0X4Z8B2D6F0H4",
 	}
 )
 
@@ -232,39 +426,66 @@ var DocOperations = []apidocs.Operation{
 	},
 
 	{
+		Method:      "GET",
+		Path:        "/ws/register",
+		Tag:         "WebSocket",
+		Summary:     "Register a device",
+		Description: "Use from a device agent to announce its cameras and obtain a single-use WebSocket ticket. The device token travels in the Authorization header because this call carries a JSON body; an unknown device and a wrong token answer the same 401 so the endpoint never leaks which devices exist. Camera parameters live only in the registration: camera_enum must be exactly 0..n-1 in the order given, resolution must not be empty, fps must be positive and supported_codec must be non-empty with every element one of " + strings.Join(ws.SupportedCodecNames(), ", ") + ". Registering again invalidates the device's previous unused ticket, and the returned device_websocket_id expires after the configured ticket TTL when it is never redeemed.",
+		Request:     docRegisterRequest{},
+		RequestExample: registerRequestExample,
+		Response:        docRegisterResponse{},
+		ResponseExample: registerResponseExample,
+		Errors: []apidocs.ErrorDoc{
+			docInvalidBody,
+			docError(400, "cameras must not be empty", "Invalid Request"),
+			docError(400, "camera_enum values must be 0..n-1 in order without gaps or duplicates", "Invalid Request"),
+			docBodyTooLarge,
+			docDeviceAuthFailed,
+			docInternalFailure,
+		},
+	},
+	{
+		Method:      "GET",
+		Path:        "/ws/device/{device_websocket_id}",
+		Tag:         "WebSocket",
+		Summary:     "Open the device WebSocket",
+		Description: "Use from a device to redeem its registration ticket and open the realtime channel. The ticket is the credential: no teamusers token is sent here. It is strictly single use: after one successful attach it is bound to that connection and becomes invalid the moment the connection closes, so a reconnect always requires a fresh registration. Attaching again with the same ticket while its session is still live answers 409; registering afresh replaces the live session and the server closes the old connection, finalizing its in-flight recordings. Control commands and acknowledgements are text JSON frames, media are binary frames carrying a length-prefixed JSON header followed by the raw bytes. A successful handshake answers 101 Switching Protocols, so the response below records the no-body default rather than a JSON document.",
+		Errors: []apidocs.ErrorDoc{
+			docTicketNotFound,
+			docTicketReplay,
+			docInternalFailure,
+		},
+	},
+
+	{
 		Method:          "GET",
-		Path:            "/api/cameras",
-		Tag:             "Cameras",
-		Summary:         "List cameras",
-		Description:     "Use to enumerate every registered camera. Cameras are returned newest first; the collection is not paginated, so the whole fleet is always returned.",
+		Path:            "/api/devices",
+		Tag:             "Devices",
+		Summary:         "List devices",
+		Description:     "Use to enumerate the devices visible to the caller. The result is filtered by the broadest matching scope: cam:read:any returns every device, cam:read:team only those of the caller's team and cam:read:own only those owned by the caller. Pass limit to cap the number returned; the default is 100 and the maximum is 1000.",
 		Security:        "bearerAuth",
-		Response:        listResponse[domain.Camera]{},
-		ResponseExample: map[string]any{"items": []any{cameraExample}},
-		Errors:          []apidocs.ErrorDoc{docUnauthorized, docForbidden, docInternalFailure},
+		Response:        listResponse[domain.Device]{},
+		ResponseExample: map[string]any{"items": []any{deviceExample}},
+		Errors:          []apidocs.ErrorDoc{docBadLimit, docUnauthorized, docForbidden, docInternalFailure},
 	},
 	{
 		Method:      "POST",
-		Path:        "/api/cameras",
-		Tag:         "Cameras",
-		Summary:     "Register a camera",
-		Description: "Use to add a camera to the fleet before it connects. New cameras start offline and turn online when they complete the WebSocket handshake. The request answers 201 Created with the camera in the body and its URL in the Location header.",
+		Path:        "/api/devices",
+		Tag:         "Devices",
+		Summary:     "Register a device",
+		Description: "Use to add a device to the fleet and issue its permanent device token, which is returned once in plaintext and can only be replaced by rotating it. Ownership is taken from the caller unless explicitly overridden: cam:manage:own callers always get owner_id set to their own subject, cam:manage:team callers may only set their own team, and cam:manage:any callers may set either field freely. The request answers 201 Created with the device and its token, and the device URL in the Location header.",
 		Security:    "bearerAuth",
-		Request:     cameraCreateRequest{},
+		Request:     docDeviceCreateRequest{},
 		RequestExample: map[string]any{
-			"name":     "Room 101 front",
+			"name":     "Room 101 device",
 			"location": "Building A / Room 101",
-			"config": map[string]any{
-				"resolution": "1920x1080",
-				"fps":        30,
-				"codec":      "h264",
-				"bitrate":    4096,
-			},
 		},
-		Response:        domain.Camera{},
-		ResponseExample: cameraExample,
+		Response:        docDeviceToken{},
+		ResponseExample: deviceTokenExample,
 		Errors: []apidocs.ErrorDoc{
 			docInvalidBody,
 			docError(400, "name is required", "Invalid Request"),
+			docError(400, "team_id and owner_id cannot be set outside your scope", "Invalid Request"),
 			docBodyTooLarge,
 			docUnauthorized,
 			docForbidden,
@@ -273,134 +494,184 @@ var DocOperations = []apidocs.Operation{
 	},
 	{
 		Method:          "GET",
-		Path:            "/api/cameras/{id}/",
-		Tag:             "Cameras",
-		Summary:         "Get a camera",
-		Description:     "Use to fetch one camera's stored state, including its current connection status and configuration.",
+		Path:            "/api/devices/{device_id}/",
+		Tag:             "Devices",
+		Summary:         "Get a device",
+		Description:     "Use to fetch one device's stored fields together with its live state: online reports whether a device WebSocket is attached right now, and cameras lists the camera parameters of the current registration (empty while the device is offline).",
 		Security:        "bearerAuth",
-		Response:        domain.Camera{},
-		ResponseExample: cameraExample,
-		Errors:          []apidocs.ErrorDoc{docUnauthorized, docForbidden, docCameraNotFound, docInternalFailure},
+		Response:        docDeviceDetail{},
+		ResponseExample: deviceDetailExample,
+		Errors:          []apidocs.ErrorDoc{docUnauthorized, docForbidden, docDeviceNotFound, docInternalFailure},
 	},
 	{
 		Method:      "PUT",
-		Path:        "/api/cameras/{id}/",
-		Tag:         "Cameras",
-		Summary:     "Update a camera",
-		Description: "Use to change a camera's name, location or configuration. The body is a partial update: present fields overwrite the stored values and absent fields keep theirs, and at least one field is required. The configuration is stored immediately but not delivered to the device; call POST /api/cameras/{id}/configure for that.",
+		Path:        "/api/devices/{device_id}/",
+		Tag:         "Devices",
+		Summary:     "Update a device",
+		Description: "Use to change a device's fixed fields. The body is a partial update: present fields overwrite the stored values and absent fields keep theirs, and at least one field is required. Ownership fields may only be changed by callers whose scope allows it. Camera parameters are not stored and cannot be changed here.",
 		Security:    "bearerAuth",
-		Request:     cameraUpdateRequest{},
+		Request:     docDeviceUpdateRequest{},
 		RequestExample: map[string]any{
-			"name":     "Room 101 front (moved)",
+			"name":     "Room 101 device (moved)",
 			"location": "Building A / Room 102",
-			"config": map[string]any{
-				"resolution": "1280x720",
-				"fps":        25,
-				"codec":      "h264",
-				"bitrate":    2048,
-			},
 		},
-		Response:        domain.Camera{},
-		ResponseExample: updatedCameraExample,
+		Response:        domain.Device{},
+		ResponseExample: updatedDeviceExample,
 		Errors: []apidocs.ErrorDoc{
 			docInvalidBody,
-			docError(400, "request body must contain at least one of name, location or config", "Invalid Request"),
+			docError(400, "request body must contain at least one of name, location, team_id or owner_id", "Invalid Request"),
 			docError(400, "name must not be empty", "Invalid Request"),
 			docBodyTooLarge,
 			docUnauthorized,
 			docForbidden,
-			docCameraNotFound,
+			docDeviceNotFound,
 			docInternalFailure,
 		},
 	},
 	{
 		Method:      "DELETE",
-		Path:        "/api/cameras/{id}/",
-		Tag:         "Cameras",
-		Summary:     "Delete a camera",
-		Description: "Use to remove a camera together with every stream and segment recorded for it. The response has no body; deleting an unknown camera answers 404 and changes nothing.",
+		Path:        "/api/devices/{device_id}/",
+		Tag:         "Devices",
+		Summary:     "Delete a device",
+		Description: "Use to remove a device together with every stream, segment and photo recorded for it. A live connection is closed and any pending ticket is invalidated. The response has no body; deleting an unknown device answers 404 and changes nothing.",
 		Security:    "bearerAuth",
-		Errors:      []apidocs.ErrorDoc{docUnauthorized, docForbidden, docCameraNotFound, docInternalFailure},
+		Errors:      []apidocs.ErrorDoc{docUnauthorized, docForbidden, docDeviceNotFound, docInternalFailure},
 	},
 	{
 		Method:      "POST",
-		Path:        "/api/cameras/{id}/configure",
-		Tag:         "Cameras",
-		Summary:     "Configure a camera",
-		Description: "Use to push new operational settings to a camera over its live WebSocket connection. The camera must be online (409 otherwise). The request answers 200 with the stored configuration; the settings are stored only after the command has been queued successfully, so a 502 leaves the stored configuration unchanged.",
+		Path:        "/api/devices/{device_id}/token",
+		Tag:         "Devices",
+		Summary:     "Rotate the device token",
+		Description: "Use to replace a device's token. The old token stops working immediately, pending registration tickets are invalidated and the device's live WebSocket connection is closed, so the device must re-register with the new token; the new plaintext token is returned once in this response. The request has no body.",
 		Security:    "bearerAuth",
-		Request:     domain.CameraConfig{},
-		RequestExample: map[string]any{
-			"resolution": "1280x720",
-			"fps":        25,
-			"codec":      "h264",
-			"bitrate":    2048,
-		},
-		Response:        configureResponse{},
-		ResponseExample: configureExample,
+		Response:        docDeviceToken{},
+		ResponseExample: deviceTokenExample,
+		Errors:          []apidocs.ErrorDoc{docUnauthorized, docForbidden, docDeviceNotFound, docInternalFailure},
+	},
+
+	{
+		Method:          "POST",
+		Path:            "/api/devices/{device_id}/camera/switch",
+		Tag:             "Devices",
+		Summary:         "Switch the active camera",
+		Description:     "Use to make one of the device's cameras the active one for subsequent operations. The device must be online (409 otherwise) and the camera enum must belong to its current registration (400 otherwise). The command is queued to the device and answers 202 Accepted with the command id; the device reports the outcome asynchronously over the control channel.",
+		Security:        "bearerAuth",
+		Request:         docCameraCommandRequest{},
+		RequestExample:  map[string]any{"camera_enum": 1},
+		Response:        docSwitchAccepted{},
+		ResponseExample: switchAcceptedExample,
 		Errors: []apidocs.ErrorDoc{
 			docInvalidBody,
+			docError(400, "camera_enum is required", "Invalid Request"),
+			docCameraEnumUnknown,
 			docBodyTooLarge,
 			docUnauthorized,
 			docForbidden,
-			docCameraNotFound,
-			docCameraOffline,
+			docDeviceNotFound,
+			docDeviceOffline,
+			docCommandFailed,
+			docInternalFailure,
+		},
+	},
+	{
+		Method:      "POST",
+		Path:        "/api/devices/{device_id}/recording/start",
+		Tag:         "Streams",
+		Summary:     "Start a recording stream",
+		Description: "Use to begin recording one camera of a device. The camera enum is validated against the device's current registration (400 when unknown, 409 when the device has no live session) and a stream must not already be active for that camera (409 otherwise). The server creates the stream row first — snapshotting the camera's resolution, fps and codec list into its metadata — then tells the device to start pushing frames and stores each uploaded chunk as a segment in object storage. The request answers 201 Created with the new stream and its URL in the Location header; a stream whose start command cannot be delivered is marked failed.",
+		Security:        "bearerAuth",
+		Request:         docCameraCommandRequest{},
+		RequestExample:  map[string]any{"camera_enum": 0},
+		Response:        domain.Stream{},
+		ResponseExample: streamExample,
+		Errors: []apidocs.ErrorDoc{
+			docInvalidBody,
+			docError(400, "camera_enum is required", "Invalid Request"),
+			docCameraEnumUnknown,
+			docBodyTooLarge,
+			docUnauthorized,
+			docForbidden,
+			docDeviceNotFound,
+			docDeviceOffline,
+			docStreamActive,
+			docCommandFailed,
+			docInternalFailure,
+		},
+	},
+	{
+		Method:      "POST",
+		Path:        "/api/devices/{device_id}/recording/stop",
+		Tag:         "Streams",
+		Summary:     "Stop the active stream",
+		Description: "Use to end a camera's active recording. The device is told to stop and buffered frames are flushed to object storage before the response is sent, so every segment of the finished recording is visible once this call returns. The request answers 200 with the stream marked completed; a camera that has no active stream answers 404.",
+		Security:        "bearerAuth",
+		Request:         docCameraCommandRequest{},
+		RequestExample:  map[string]any{"camera_enum": 0},
+		Response:        domain.Stream{},
+		ResponseExample: completedStreamExample,
+		Errors: []apidocs.ErrorDoc{
+			docInvalidBody,
+			docError(400, "camera_enum is required", "Invalid Request"),
+			docBodyTooLarge,
+			docUnauthorized,
+			docForbidden,
+			docDeviceNotFound,
+			docStreamNotFound,
+			docDeviceOffline,
+			docCommandFailed,
+			docInternalFailure,
+		},
+	},
+	{
+		Method:          "POST",
+		Path:            "/api/devices/{device_id}/photo",
+		Tag:             "Photos",
+		Summary:         "Capture a photo",
+		Description:     "Use to ask a camera for a single still image. The device must be online (409 otherwise) and the camera enum must belong to its current registration (400 otherwise). The command is queued to the device and answers 202 Accepted with the command id and request id; the device later uploads a photo binary frame carrying the same request_id, and the uploaded photo becomes visible under the device's photos.",
+		Security:        "bearerAuth",
+		Request:         docCameraCommandRequest{},
+		RequestExample:  map[string]any{"camera_enum": 0},
+		Response:        docPhotoAccepted{},
+		ResponseExample: photoAcceptedExample,
+		Errors: []apidocs.ErrorDoc{
+			docInvalidBody,
+			docError(400, "camera_enum is required", "Invalid Request"),
+			docCameraEnumUnknown,
+			docBodyTooLarge,
+			docUnauthorized,
+			docForbidden,
+			docDeviceNotFound,
+			docDeviceOffline,
 			docCommandFailed,
 			docInternalFailure,
 		},
 	},
 
 	{
-		Method:          "POST",
-		Path:            "/api/cameras/{id}/stream/start",
-		Tag:             "Streams",
-		Summary:         "Start a recording stream",
-		Description:     "Use to begin recording a camera. The camera must be online. The server creates the stream record first, then tells the device to start sending frames and stores each uploaded chunk as a segment in object storage. The request answers 201 Created with the new stream and its URL in the Location header; a stream whose start command cannot be delivered is marked failed.",
-		Security:        "bearerAuth",
-		Response:        domain.Stream{},
-		ResponseExample: streamExample,
-		Errors: []apidocs.ErrorDoc{
-			docUnauthorized,
-			docForbidden,
-			docCameraNotFound,
-			docCameraOffline,
-			docCommandFailed,
-			docInternalFailure,
-		},
-	},
-	{
-		Method:          "POST",
-		Path:            "/api/cameras/{id}/stream/stop",
-		Tag:             "Streams",
-		Summary:         "Stop the active stream",
-		Description:     "Use to end a camera's active recording. The device is told to stop and buffered frames are flushed to object storage before the response is sent, so every segment of the finished recording is visible once this call returns. The request answers 200 with the stream marked completed; a camera that is offline or has no active stream answers 409.",
-		Security:        "bearerAuth",
-		Response:        domain.Stream{},
-		ResponseExample: completedStreamExample,
-		Errors: []apidocs.ErrorDoc{
-			docUnauthorized,
-			docForbidden,
-			docCameraNotFound,
-			docCameraOffline,
-			docNotStreaming,
-			docCommandFailed,
-			docInternalFailure,
-		},
-	},
-	{
 		Method:          "GET",
-		Path:            "/api/cameras/{id}/streams",
+		Path:            "/api/devices/{device_id}/streams",
 		Tag:             "Streams",
-		Summary:         "List a camera's streams",
-		Description:     "Use to browse the recording history of one camera, newest first. Pass limit to cap the number of streams returned; the default is 100 and the maximum is 1000.",
+		Summary:         "List a device's streams",
+		Description:     "Use to browse the recording history of one device, newest first. Pass limit to cap the number of streams returned; the default is 100 and the maximum is 1000.",
 		Security:        "bearerAuth",
 		Response:        listResponse[domain.Stream]{},
 		ResponseExample: map[string]any{"items": []any{streamExample, completedStreamExample}},
-		Errors:          []apidocs.ErrorDoc{docBadLimit, docUnauthorized, docForbidden, docCameraNotFound, docInternalFailure},
+		Errors:          []apidocs.ErrorDoc{docBadLimit, docUnauthorized, docForbidden, docDeviceNotFound, docInternalFailure},
 	},
 	{
 		Method:          "GET",
-		Path:            "/api/streams/{id}/",
+		Path:            "/api/devices/{device_id}/photos",
+		Tag:             "Photos",
+		Summary:         "List a device's photos",
+		Description:     "Use to browse the photos captured by one device, newest first. Pass limit to cap the number returned; the default is 100 and the maximum is 1000. Photos carry metadata only; use GET /api/photos/{photo_id}/ when a download URL is needed.",
+		Security:        "bearerAuth",
+		Response:        listResponse[domain.Photo]{},
+		ResponseExample: map[string]any{"items": []any{photoExample}},
+		Errors:          []apidocs.ErrorDoc{docBadLimit, docUnauthorized, docForbidden, docDeviceNotFound, docInternalFailure},
+	},
+	{
+		Method:          "GET",
+		Path:            "/api/streams/{stream_id}/",
 		Tag:             "Streams",
 		Summary:         "Get a stream",
 		Description:     "Use to fetch one stream with its segments and a pre-signed download URL for each segment, valid for 15 minutes. Pass limit to cap the number of segments returned; the default is 100 and the maximum is 1000.",
@@ -411,26 +682,24 @@ var DocOperations = []apidocs.Operation{
 	},
 	{
 		Method:          "GET",
-		Path:            "/api/streams/{id}/segments",
+		Path:            "/api/streams/{stream_id}/segments",
 		Tag:             "Streams",
 		Summary:         "List stream segments",
-		Description:     "Use to enumerate the stored chunks of one stream in recording order. Pass limit to cap the number returned; the default is 100 and the maximum is 1000. Segments carry storage keys only; use GET /api/streams/{id} when download URLs are needed.",
+		Description:     "Use to enumerate the stored chunks of one stream in recording order. Pass limit to cap the number returned; the default is 100 and the maximum is 1000. Segments carry storage keys only; use GET /api/streams/{stream_id}/ when download URLs are needed.",
 		Security:        "bearerAuth",
 		Response:        listResponse[domain.StreamSegment]{},
 		ResponseExample: map[string]any{"items": []any{segmentExample}},
 		Errors:          []apidocs.ErrorDoc{docBadLimit, docUnauthorized, docForbidden, docStreamNotFound, docInternalFailure},
 	},
-
 	{
-		Method:      "GET",
-		Path:        "/ws/camera/{id}",
-		Tag:         "WebSocket",
-		Summary:     "Open the camera WebSocket",
-		Description: "Use from a camera device to open its authenticated realtime channel. The teamusers access token travels in the token query parameter because WebSocket clients cannot set an Authorization header; a missing or invalid token answers 401 before any upgrade. A successful handshake answers 101 Switching Protocols and the connection then carries binary frame messages; the response below records the no-body default because the success is a protocol switch rather than a JSON document.",
-		Errors: []apidocs.ErrorDoc{
-			docError(401, "websocket authentication failed", "Unauthorized"),
-			docCameraNotFound,
-			docInternalFailure,
-		},
+		Method:          "GET",
+		Path:            "/api/photos/{photo_id}/",
+		Tag:             "Photos",
+		Summary:         "Get a photo",
+		Description:     "Use to fetch one photo's metadata together with a pre-signed download URL, valid for 15 minutes.",
+		Security:        "bearerAuth",
+		Response:        docPhotoDetail{},
+		ResponseExample: photoDetailExample,
+		Errors:          []apidocs.ErrorDoc{docUnauthorized, docForbidden, docPhotoNotFound, docInternalFailure},
 	},
 }

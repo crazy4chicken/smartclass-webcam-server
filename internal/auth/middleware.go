@@ -1,11 +1,11 @@
 // Package auth provides HTTP authentication and authorization middleware for
 // the webcam server, backed by the teamusers IAM service.
 //
-// Middleware and WSUpgradeAuth only need the JWKS verifier and work without any
-// credentials of our own. Require additionally asks teamusers for the caller's
-// effective permissions, so a service token must be supplied with
-// iam.WithServiceToken or iam.WithTokenSource for authorization to succeed;
-// without one Require fails closed and rejects every request.
+// Middleware only needs the JWKS verifier and works without any credentials of
+// our own. Require additionally asks teamusers for the caller's effective
+// permissions, so a service token must be supplied with iam.WithServiceToken or
+// iam.WithTokenSource for authorization to succeed; without one Require fails
+// closed and rejects every request.
 package auth
 
 import (
@@ -18,10 +18,6 @@ import (
 
 	iam "github.com/crazy4chicken/nsc-teamusers/sdk/go"
 )
-
-// tokenQueryParam carries the access token during WebSocket upgrades, where the
-// browser WebSocket API cannot set request headers.
-const tokenQueryParam = "token"
 
 // Auth couples a teamusers JWKS verifier with the SDK middleware client that
 // performs permission checks against the local permission cache.
@@ -118,27 +114,6 @@ func (a *Auth) Require(permission string, resourceFn func(*http.Request) iam.Res
 		}
 	}
 	return a.client.Require(permission, resourceFn)
-}
-
-// WSUpgradeAuth extracts the access token from the token query parameter and
-// verifies it. WebSocket clients cannot set an Authorization header, so the
-// token travels with the upgrade request instead.
-func (a *Auth) WSUpgradeAuth(r *http.Request) (*iam.Claims, error) {
-	if r == nil {
-		return nil, errors.New("auth: nil websocket upgrade request")
-	}
-	if a.isDev() {
-		return &iam.Claims{Subject: "dev-camera", Kind: "service"}, nil
-	}
-	token := strings.TrimSpace(r.URL.Query().Get(tokenQueryParam))
-	if token == "" {
-		return nil, fmt.Errorf("auth: missing %q query parameter", tokenQueryParam)
-	}
-	claims, err := a.verifier.Verify(r.Context(), token)
-	if err != nil {
-		return nil, fmt.Errorf("auth: verify websocket token: %w", err)
-	}
-	return &claims, nil
 }
 
 // ClaimsFromContext returns the verified claims stored by Middleware, or nil

@@ -15,7 +15,7 @@ import (
 
 // streamColumns is selected into a domain.Stream; it must stay in sync with
 // scanStream.
-const streamColumns = `id, camera_id, status, started_at, ended_at, metadata`
+const streamColumns = `id, device_id, camera_enum, status, started_at, ended_at, metadata`
 
 // StreamStore provides persistence for recording streams.
 type StreamStore struct {
@@ -27,26 +27,31 @@ func NewStreamStore(pool *pgxpool.Pool) *StreamStore {
 	return &StreamStore{pool: pool}
 }
 
-// Create starts a new stream for cameraID with a generated ULID and returns the
-// stored row. New streams start out active.
-func (s *StreamStore) Create(ctx context.Context, cameraID string, metadata domain.StreamMetadata) (*domain.Stream, error) {
-	metaJSON, err := json.Marshal(metadata)
+// Create starts a new stream for one camera of deviceID with a generated ULID
+// and returns the stored row. New streams start out active; it returns
+// ErrConflict when the device already has an active stream for that camera.
+func (s *StreamStore) Create(ctx context.Context, deviceID string, cameraEnum int, md domain.StreamMetadata) (*domain.Stream, error) {
+	metaJSON, err := json.Marshal(md)
 	if err != nil {
 		return nil, fmt.Errorf("encode stream metadata: %w", err)
 	}
 
 	st := &domain.Stream{
-		ID:       ulid.Make().String(),
-		CameraID: cameraID,
-		Status:   domain.StreamStatusActive,
-		Metadata: metadata,
+		ID:         ulid.Make().String(),
+		DeviceID:   deviceID,
+		CameraEnum: cameraEnum,
+		Status:     domain.StreamStatusActive,
+		Metadata:   md,
 	}
 	err = s.pool.QueryRow(ctx, `
-		INSERT INTO streams (id, camera_id, status, metadata)
-		VALUES ($1, $2, $3, $4)
+		INSERT INTO streams (id, device_id, camera_enum, status, metadata)
+		VALUES ($1, $2, $3, $4, $5)
 		RETURNING started_at`,
-		st.ID, st.CameraID, string(st.Status), metaJSON,
+		st.ID, st.DeviceID, st.CameraEnum, string(st.Status), metaJSON,
 	).Scan(&st.StartedAt)
+	if isUniqueViolation(err) {
+		return nil, fmt.Errorf("stream for device %s camera %d: %w", deviceID, cameraEnum, ErrConflict)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("create stream: %w", err)
 	}
@@ -67,14 +72,14 @@ func (s *StreamStore) Get(ctx context.Context, id string) (*domain.Stream, error
 	return st, nil
 }
 
-// ListByCamera returns the streams of cameraID, newest first. A limit of zero
+// ListByDevice returns the streams of deviceID, newest first. A limit of zero
 // or less applies a default limit.
-func (s *StreamStore) ListByCamera(ctx context.Context, cameraID string, limit int) ([]domain.Stream, error) {
+func (s *StreamStore) ListByDevice(ctx context.Context, deviceID string, limit int) ([]domain.Stream, error) {
 	rows, err := s.pool.Query(ctx,
-		`SELECT `+streamColumns+` FROM streams WHERE camera_id = $1 ORDER BY started_at DESC, id DESC LIMIT $2`,
-		cameraID, normalizeLimit(limit))
+		`SELECT `+streamColumns+` FROM streams WHERE device_id = $1 ORDER BY started_at DESC, id DESC LIMIT $2`,
+		deviceID, normalizeLimit(limit))
 	if err != nil {
-		return nil, fmt.Errorf("list streams for camera %s: %w", cameraID, err)
+		return nil, fmt.Errorf("list streams for device %s: %w", deviceID, err)
 	}
 	defer rows.Close()
 
@@ -82,33 +87,49 @@ func (s *StreamStore) ListByCamera(ctx context.Context, cameraID string, limit i
 	for rows.Next() {
 		st, err := scanStream(rows)
 		if err != nil {
-			return nil, fmt.Errorf("list streams for camera %s: %w", cameraID, err)
+			return nil, fmt.Errorf("list streams for device %s: %w", deviceID, err)
 		}
 		streams = append(streams, *st)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("list streams for camera %s: %w", cameraID, err)
+		return nil, fmt.Errorf("list streams for device %s: %w", deviceID, err)
 	}
 	return streams, nil
 }
 
-// UpdateStatus sets the stream status. Marking a stream completed or failed
-// records ended_at; marking it active again clears it. It returns ErrNotFound
-// when the stream does not exist.
-func (s *StreamStore) UpdateStatus(ctx context.Context, id string, status domain.StreamStatus) error {
-	tag, err := s.pool.Exec(ctx, `
-		UPDATE streams
-		SET status = $2,
-		    ended_at = CASE WHEN $2 = 'active' THEN NULL ELSE COALESCE(ended_at, now()) END
-		WHERE id = $1`,
-		id, string(status))
+// Active returns the active stream of one camera of deviceID. It returns
+// ErrNotFound when no such stream exists.
+func (s *StreamStore) Active(ctx context.Context, deviceID string, cameraEnum int) (*domain.Stream, error) {
+	st, err := scanStream(s.pool.QueryRow(ctx,
+		`SELECT `+streamColumns+` FROM streams
+		 WHERE device_id = $1 AND camera_enum = $2 AND status = 'active'
+		 ORDER BY started_at DESC LIMIT 1`,
+		deviceID, cameraEnum))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, fmt.Errorf("active stream for device %s camera %d: %w", deviceID, cameraEnum, ErrNotFound)
+	}
 	if err != nil {
-		return fmt.Errorf("update stream %s status: %w", id, err)
+		return nil, fmt.Errorf("active stream for device %s camera %d: %w", deviceID, cameraEnum, err)
 	}
-	if tag.RowsAffected() == 0 {
-		return fmt.Errorf("stream %s: %w", id, ErrNotFound)
+	return st, nil
+}
+
+// Finish marks the stream completed or failed and records ended_at. It returns
+// ErrNotFound when the stream does not exist.
+func (s *StreamStore) Finish(ctx context.Context, id string, status domain.StreamStatus) (*domain.Stream, error) {
+	st, err := scanStream(s.pool.QueryRow(ctx, `
+		UPDATE streams
+		SET status = $2, ended_at = COALESCE(ended_at, now())
+		WHERE id = $1
+		RETURNING `+streamColumns,
+		id, string(status)))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, fmt.Errorf("stream %s: %w", id, ErrNotFound)
 	}
-	return nil
+	if err != nil {
+		return nil, fmt.Errorf("finish stream %s: %w", id, err)
+	}
+	return st, nil
 }
 
 // scanStream reads one row selected with streamColumns.
@@ -118,7 +139,7 @@ func scanStream(row pgx.Row) (*domain.Stream, error) {
 		status   string
 		metadata []byte
 	)
-	if err := row.Scan(&st.ID, &st.CameraID, &status, &st.StartedAt, &st.EndedAt, &metadata); err != nil {
+	if err := row.Scan(&st.ID, &st.DeviceID, &st.CameraEnum, &status, &st.StartedAt, &st.EndedAt, &metadata); err != nil {
 		return nil, err
 	}
 	st.Status = domain.StreamStatus(status)

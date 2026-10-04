@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -14,8 +15,8 @@ import (
 
 // segmentColumns is selected into a domain.StreamSegment; it must stay in sync
 // with scanSegment. duration_ms is coalesced because
-// domain.StreamSegment.DurationMs is a plain int.
-const segmentColumns = `id, stream_id, camera_id, segment_seq, storage_key, size_bytes, COALESCE(duration_ms, 0) AS duration_ms, created_at`
+// domain.StreamSegment.DurationMS is a plain int.
+const segmentColumns = `id, stream_id, device_id, camera_enum, segment_seq, storage_key, size_bytes, COALESCE(duration_ms, 0) AS duration_ms, created_at`
 
 // SegmentStore provides persistence for uploaded stream segments.
 type SegmentStore struct {
@@ -27,38 +28,25 @@ func NewSegmentStore(pool *pgxpool.Pool) *SegmentStore {
 	return &SegmentStore{pool: pool}
 }
 
-// Create inserts seg, assigning a ULID when seg.ID is empty, and fills in
-// seg.CreatedAt with the database timestamp.
-func (s *SegmentStore) Create(ctx context.Context, seg *domain.StreamSegment) error {
+// Create inserts seg, assigning a ULID and a creation timestamp when they are
+// zero, and returns the stored segment.
+func (s *SegmentStore) Create(ctx context.Context, seg *domain.StreamSegment) (*domain.StreamSegment, error) {
 	if seg == nil {
-		return errors.New("store: nil segment")
+		return nil, errors.New("store: nil segment")
 	}
 	if seg.ID == "" {
 		seg.ID = ulid.Make().String()
 	}
-
-	err := s.pool.QueryRow(ctx, `
-		INSERT INTO stream_segments (id, stream_id, camera_id, segment_seq, storage_key, size_bytes, duration_ms)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)
-		RETURNING created_at`,
-		seg.ID, seg.StreamID, seg.CameraID, seg.SegmentSeq, seg.StorageKey, seg.SizeBytes, seg.DurationMs,
-	).Scan(&seg.CreatedAt)
-	if err != nil {
-		return fmt.Errorf("create segment %s: %w", seg.ID, err)
+	if seg.CreatedAt.IsZero() {
+		seg.CreatedAt = time.Now().UTC()
 	}
-	return nil
-}
 
-// Get returns the segment with the given id. It returns ErrNotFound when no
-// such segment exists.
-func (s *SegmentStore) Get(ctx context.Context, id string) (*domain.StreamSegment, error) {
-	seg, err := scanSegment(s.pool.QueryRow(ctx,
-		`SELECT `+segmentColumns+` FROM stream_segments WHERE id = $1`, id))
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, fmt.Errorf("segment %s: %w", id, ErrNotFound)
-	}
+	_, err := s.pool.Exec(ctx, `
+		INSERT INTO stream_segments (id, stream_id, device_id, camera_enum, segment_seq, storage_key, size_bytes, duration_ms, created_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+		seg.ID, seg.StreamID, seg.DeviceID, seg.CameraEnum, seg.SegmentSeq, seg.StorageKey, seg.SizeBytes, seg.DurationMS, seg.CreatedAt)
 	if err != nil {
-		return nil, fmt.Errorf("get segment %s: %w", id, err)
+		return nil, fmt.Errorf("create segment %s: %w", seg.ID, err)
 	}
 	return seg, nil
 }
@@ -91,8 +79,8 @@ func (s *SegmentStore) ListByStream(ctx context.Context, streamID string, limit 
 // scanSegment reads one row selected with segmentColumns.
 func scanSegment(row pgx.Row) (*domain.StreamSegment, error) {
 	var seg domain.StreamSegment
-	if err := row.Scan(&seg.ID, &seg.StreamID, &seg.CameraID, &seg.SegmentSeq,
-		&seg.StorageKey, &seg.SizeBytes, &seg.DurationMs, &seg.CreatedAt); err != nil {
+	if err := row.Scan(&seg.ID, &seg.StreamID, &seg.DeviceID, &seg.CameraEnum, &seg.SegmentSeq,
+		&seg.StorageKey, &seg.SizeBytes, &seg.DurationMS, &seg.CreatedAt); err != nil {
 		return nil, err
 	}
 	return &seg, nil

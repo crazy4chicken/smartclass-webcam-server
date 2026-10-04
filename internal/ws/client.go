@@ -1,7 +1,6 @@
 package ws
 
 import (
-	"encoding/base64"
 	"encoding/json"
 	"log/slog"
 	"sync"
@@ -11,39 +10,45 @@ import (
 )
 
 const (
-	// writeWait is the deadline for a single write to the camera.
+	// writeWait is the deadline for a single write to a device.
 	writeWait = 10 * time.Second
-	// pongWait is how long a camera may stay silent before the connection is
+	// pongWait is how long a device may stay silent before the connection is
 	// considered dead. It must exceed pingInterval.
 	pongWait = 60 * time.Second
-	// pingInterval is how often the server pings the camera.
+	// pingInterval is how often the server pings the device.
 	pingInterval = 30 * time.Second
-	// sendBufferSize is the outbound command queue depth per camera.
+	// sendBufferSize is the outbound command queue depth per device.
 	sendBufferSize = 16
-	// maxMessageSize bounds an inbound message; frames are base64 JPEG data.
+	// maxMessageSize bounds an inbound message and therefore the size of a
+	// single media frame.
 	maxMessageSize = 16 << 20
 )
 
-// Client is a single camera WebSocket connection registered with a Hub.
+// Client is a single device WebSocket connection registered with a Hub.
 type Client struct {
-	CameraID string
-	Conn     *websocket.Conn
-	Hub      *Hub
-	Send     chan Message
+	deviceID string
+	conn     *websocket.Conn
+	hub      *Hub
+	outbound chan Message
 
 	mu     sync.Mutex
 	closed bool
 }
 
-// NewClient wraps conn as a camera client. The returned client is not yet
-// registered with the hub.
-func NewClient(cameraID string, conn *websocket.Conn, hub *Hub) *Client {
+// NewClient wraps conn as the connection of deviceID. The returned client is
+// not yet registered with the hub.
+func NewClient(deviceID string, conn *websocket.Conn, hub *Hub) *Client {
 	return &Client{
-		CameraID: cameraID,
-		Conn:     conn,
-		Hub:      hub,
-		Send:     make(chan Message, sendBufferSize),
+		deviceID: deviceID,
+		conn:     conn,
+		hub:      hub,
+		outbound: make(chan Message, sendBufferSize),
 	}
+}
+
+// DeviceID returns the device this connection belongs to.
+func (c *Client) DeviceID() string {
+	return c.deviceID
 }
 
 // send queues msg for delivery without blocking the caller.
@@ -55,186 +60,225 @@ func (c *Client) send(msg Message) error {
 		return ErrClientClosed
 	}
 	select {
-	case c.Send <- msg:
+	case c.outbound <- msg:
 		return nil
 	default:
 		return ErrSendBufferFull
 	}
 }
 
-// close marks the client as closed and closes Send so its write pump stops. It
-// is safe to call multiple times.
-func (c *Client) close() {
+// Close marks the client closed, stops its write pump and force-closes the
+// underlying connection. It is safe to call more than once.
+func (c *Client) Close() {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	if c.closed {
+		c.mu.Unlock()
 		return
 	}
 	c.closed = true
-	close(c.Send)
+	close(c.outbound)
+	c.mu.Unlock()
+
+	_ = c.conn.Close()
 }
 
-// ReadPump reads messages from the camera until the connection fails or closes,
-// then unregisters the client and closes the connection. It must run in its own
-// goroutine.
+// ReadPump reads from the device until the connection fails or closes. Text
+// frames carry control messages and binary frames carry media; both are
+// dispatched on this goroutine, so handlers must not block. ReadPump blocks and
+// is meant to run on the connection's own goroutine.
 func (c *Client) ReadPump() {
 	defer func() {
-		// Remove synchronously from the hub map so the camera status can
-		// be updated immediately after ReadPump returns.
-		c.Hub.removeClient(c)
-		_ = c.Conn.Close()
+		_ = c.conn.Close()
 	}()
 
-	c.Conn.SetReadLimit(maxMessageSize)
-	_ = c.Conn.SetReadDeadline(time.Now().Add(pongWait))
-	c.Conn.SetPongHandler(func(string) error {
-		return c.Conn.SetReadDeadline(time.Now().Add(pongWait))
+	c.conn.SetReadLimit(maxMessageSize)
+	_ = c.conn.SetReadDeadline(time.Now().Add(pongWait))
+	c.conn.SetPongHandler(func(string) error {
+		return c.conn.SetReadDeadline(time.Now().Add(pongWait))
 	})
 
 	for {
-		var msg Message
-		if err := c.Conn.ReadJSON(&msg); err != nil {
+		messageType, raw, err := c.conn.ReadMessage()
+		if err != nil {
 			if websocket.IsUnexpectedCloseError(err,
 				websocket.CloseNormalClosure,
 				websocket.CloseGoingAway,
 				websocket.CloseNoStatusReceived,
+				websocket.ClosePolicyViolation,
 			) {
-				slog.Warn("camera read failed", "camera_id", c.CameraID, "error", err)
+				slog.Warn("device read failed", "device_id", c.deviceID, "error", err)
 			}
 			return
 		}
-		// Any inbound traffic proves the peer is alive.
-		_ = c.Conn.SetReadDeadline(time.Now().Add(pongWait))
+		// Any inbound traffic proves the peer is still alive.
+		_ = c.conn.SetReadDeadline(time.Now().Add(pongWait))
 
-		switch msg.Type {
-		case MsgFrame:
-			c.handleFrame(msg)
-		case MsgPong:
-			// Keepalive only; the read deadline was already reset above.
-		case MsgStreamStarted, MsgStreamStopped:
-			slog.Info("camera stream state changed",
-				"camera_id", c.CameraID,
-				"type", msg.Type,
-				"stream_id", stringField(msg.Payload, payloadKeyStreamID),
-			)
-		case MsgStatus:
-			slog.Info("camera status", "camera_id", c.CameraID, "payload", msg.Payload)
-		case MsgError:
-			slog.Warn("camera reported an error", "camera_id", c.CameraID, "payload", msg.Payload)
-		default:
-			slog.Debug("ignoring unknown camera message", "camera_id", c.CameraID, "type", msg.Type)
+		switch messageType {
+		case websocket.BinaryMessage:
+			c.handleBinary(raw)
+		case websocket.TextMessage:
+			c.handleText(raw)
 		}
 	}
 }
 
-// handleFrame decodes and dispatches a single frame message.
-func (c *Client) handleFrame(msg Message) {
-	streamID := stringField(msg.Payload, payloadKeyStreamID)
-	if streamID == "" {
-		slog.Warn("discarding frame without stream_id", "camera_id", c.CameraID)
+// handleText dispatches one control message received from the device.
+func (c *Client) handleText(raw []byte) {
+	var msg Message
+	if err := json.Unmarshal(raw, &msg); err != nil {
+		slog.Debug("discarding malformed control message", "device_id", c.deviceID, "error", err)
 		return
 	}
 
-	encoded := stringField(msg.Payload, payloadKeyData)
-	if encoded == "" {
-		slog.Warn("discarding frame without data", "camera_id", c.CameraID, "stream_id", streamID)
-		return
+	switch msg.Type {
+	case ControlPong:
+		// Keepalive only; the read deadline was already refreshed.
+	case ControlAck:
+		slog.Debug("device acknowledged command", "device_id", c.deviceID, "id", msg.ID, "payload", msg.Payload)
+	case ControlStatus:
+		slog.Info("device status", "device_id", c.deviceID, "payload", msg.Payload)
+	case ControlError:
+		slog.Info("device reported an error", "device_id", c.deviceID, "id", msg.ID, "payload", msg.Payload)
+	default:
+		slog.Debug("ignoring unknown control message", "device_id", c.deviceID, "type", msg.Type)
 	}
-	data, err := base64.StdEncoding.DecodeString(encoded)
+}
+
+// handleBinary dispatches one decoded media frame to the hub handlers.
+func (c *Client) handleBinary(raw []byte) {
+	msg, data, err := DecodeBinary(raw)
 	if err != nil {
-		slog.Warn("discarding frame with invalid base64 data",
-			"camera_id", c.CameraID, "stream_id", streamID, "error", err)
+		slog.Debug("discarding malformed media frame", "device_id", c.deviceID, "error", err)
 		return
 	}
 
-	ts := time.Now().UTC()
-	if raw := stringField(msg.Payload, payloadKeyTS); raw != "" {
-		parsed, err := time.Parse(time.RFC3339Nano, raw)
-		if err != nil {
-			slog.Debug("frame timestamp not RFC3339, using receive time",
-				"camera_id", c.CameraID, "stream_id", streamID, "ts", raw, "error", err)
-		} else {
-			ts = parsed
+	switch msg.Channel {
+	case ChannelRecording:
+		if msg.Type != MediaFrame {
+			slog.Debug("ignoring unknown recording message", "device_id", c.deviceID, "type", msg.Type)
+			return
 		}
-	}
+		streamID := stringField(msg.Payload, PKStreamID)
+		cameraEnum, ok := numberField(msg.Payload, PKCameraEnum)
+		if streamID == "" || !ok {
+			slog.Debug("discarding frame without stream_id or camera_enum",
+				"device_id", c.deviceID, "stream_id", streamID, "payload", msg.Payload)
+			return
+		}
+		seq, _ := numberField(msg.Payload, PKSeq)
+		c.hub.dispatchRecording(c.deviceID, streamID, int(cameraEnum), seq, timeField(msg.Payload, PKTS), data)
 
-	c.Hub.dispatchFrame(c.CameraID, streamID, intField(msg.Payload, payloadKeySeq), data, ts)
+	case ChannelPhoto:
+		if msg.Type != MediaPhoto {
+			slog.Debug("ignoring unknown photo message", "device_id", c.deviceID, "type", msg.Type)
+			return
+		}
+		cameraEnum, ok := numberField(msg.Payload, PKCameraEnum)
+		if !ok {
+			slog.Debug("discarding photo without camera_enum", "device_id", c.deviceID, "payload", msg.Payload)
+			return
+		}
+		c.hub.dispatchPhoto(c.deviceID, int(cameraEnum),
+			stringField(msg.Payload, PKRequestID),
+			stringField(msg.Payload, PKContentType),
+			timeField(msg.Payload, PKTS),
+			data)
+
+	default:
+		slog.Debug("ignoring media frame on unknown channel",
+			"device_id", c.deviceID, "channel", msg.Channel, "type", msg.Type)
+	}
 }
 
-// WritePump writes queued messages and periodic pings to the camera, then
-// closes the connection when the client is closed or a write fails. It must run
-// in its own goroutine.
+// WritePump writes queued commands and periodic keepalives to the device. It
+// stops when the client is closed or a write fails, and is meant to run on its
+// own goroutine.
 func (c *Client) WritePump() {
 	ticker := time.NewTicker(pingInterval)
 	defer func() {
 		ticker.Stop()
-		_ = c.Conn.Close()
+		_ = c.conn.Close()
 	}()
 
 	for {
 		select {
-		case msg, ok := <-c.Send:
+		case msg, ok := <-c.outbound:
 			if !ok {
-				// The hub closed Send while unregistering this client.
-				_ = c.Conn.WriteControl(websocket.CloseMessage,
+				// The client was closed while unregistering.
+				_ = c.conn.WriteControl(websocket.CloseMessage,
 					websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""),
 					time.Now().Add(writeWait))
 				return
 			}
 			if err := c.writeJSON(msg); err != nil {
-				slog.Warn("camera write failed", "camera_id", c.CameraID, "error", err)
+				slog.Warn("device write failed", "device_id", c.deviceID, "error", err)
 				return
 			}
 		case <-ticker.C:
 			if err := c.ping(); err != nil {
-				slog.Warn("camera ping failed", "camera_id", c.CameraID, "error", err)
+				slog.Warn("device ping failed", "device_id", c.deviceID, "error", err)
 				return
 			}
 		}
 	}
 }
 
-// ping sends a protocol-level ping followed by an application-level ping
-// message so the camera keeps both its socket and its read deadline alive.
+// ping sends a protocol-level ping followed by an application-level control
+// ping so the device keeps both its socket and its read deadline alive.
 func (c *Client) ping() error {
-	if err := c.Conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(writeWait)); err != nil {
+	if err := c.conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(writeWait)); err != nil {
 		return err
 	}
 	return c.writeJSON(Message{
-		Type:    MsgPing,
-		Payload: map[string]any{payloadKeyTS: time.Now().UTC().Format(time.RFC3339Nano)},
+		Channel: ChannelControl,
+		Type:    ControlPing,
+		Payload: map[string]any{PKTS: time.Now().UTC().Format(time.RFC3339Nano)},
 	})
 }
 
 // writeJSON writes msg with a fresh write deadline.
 func (c *Client) writeJSON(msg Message) error {
-	if err := c.Conn.SetWriteDeadline(time.Now().Add(writeWait)); err != nil {
+	if err := c.conn.SetWriteDeadline(time.Now().Add(writeWait)); err != nil {
 		return err
 	}
-	return c.Conn.WriteJSON(msg)
+	return c.conn.WriteJSON(msg)
 }
 
-// stringField returns the string value at key, or "" when absent or not a string.
+// stringField returns the string value at key, or "" when it is absent or not a
+// string.
 func stringField(payload map[string]any, key string) string {
 	s, _ := payload[key].(string)
 	return s
 }
 
-// intField returns the numeric value at key as an int, or 0 when absent or not
-// a number.
-func intField(payload map[string]any, key string) int {
+// numberField returns the numeric value at key as an int64. It reports false
+// when the key is absent or not a number.
+func numberField(payload map[string]any, key string) (int64, bool) {
 	switch v := payload[key].(type) {
 	case float64:
-		return int(v)
+		return int64(v), true
 	case json.Number:
-		if n, err := v.Int64(); err == nil {
-			return int(n)
-		}
+		n, err := v.Int64()
+		return n, err == nil
 	case int:
-		return v
+		return int64(v), true
 	case int64:
-		return int(v)
+		return v, true
 	}
-	return 0
+	return 0, false
+}
+
+// timeField returns the RFC3339Nano timestamp at key, or the zero time when it
+// is absent or malformed.
+func timeField(payload map[string]any, key string) time.Time {
+	raw := stringField(payload, key)
+	if raw == "" {
+		return time.Time{}
+	}
+	ts, err := time.Parse(time.RFC3339Nano, raw)
+	if err != nil {
+		slog.Debug("media timestamp is not RFC3339Nano", "ts", raw, "error", err)
+		return time.Time{}
+	}
+	return ts
 }

@@ -115,9 +115,12 @@ func run() error {
 	hub := ws.NewHub()
 	go hub.Run()
 
+	registry := ws.NewRegistry(cfg.WSTicketTTL)
+	slog.Info("websocket ticket registry ready", "ticket_ttl", cfg.WSTicketTTL)
+
 	srv := &http.Server{
 		Addr:    cfg.ListenAddr,
-		Handler: httpapi.NewRouter(authn, store.New(pool), hub, objStore),
+		Handler: httpapi.NewRouter(authn, store.New(pool), hub, registry, objStore),
 		// ReadHeaderTimeout only: WebSocket connections are long-lived and
 		// would be cut short by a write timeout.
 		ReadHeaderTimeout: 10 * time.Second,

@@ -2,114 +2,207 @@ package httpapi
 
 import (
 	"context"
+	"crypto/subtle"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/gorilla/websocket"
 
-	"github.com/crazy4chicken/smartclass-webcam-server/internal/domain"
+	"github.com/crazy4chicken/smartclass-webcam-server/internal/auth"
 	"github.com/crazy4chicken/smartclass-webcam-server/internal/store"
 	"github.com/crazy4chicken/smartclass-webcam-server/internal/ws"
 )
 
 const (
-	// wsHandshakeTimeout bounds the WebSocket upgrade handshake.
+	// wsHandshakeTimeout bounds the device WebSocket upgrade handshake.
 	wsHandshakeTimeout = 10 * time.Second
-	// statusWriteTimeout bounds camera status writes made after a connection
-	// ends, which must not use the cancelled request context.
-	statusWriteTimeout = 5 * time.Second
-	// drainTimeout bounds how long a stopping stream waits for its buffered
-	// frames to reach object storage before the response is returned.
-	drainTimeout = 10 * time.Second
+	// deviceDrainTimeout bounds how long a disconnected device's recordings
+	// may take to drain and finalize.
+	deviceDrainTimeout = 30 * time.Second
 )
 
-// cameraUpgrader upgrades camera HTTP requests to WebSocket connections. Camera
-// clients are not browsers, so every origin is accepted; requests are
-// authenticated by the handler before the upgrade.
-var cameraUpgrader = websocket.Upgrader{
+// deviceUpgrader upgrades device HTTP requests to WebSocket connections.
+// Devices are not browsers, so every origin is accepted; the connection is
+// authenticated by its registration ticket before the upgrade.
+var deviceUpgrader = websocket.Upgrader{
 	HandshakeTimeout: wsHandshakeTimeout,
 	ReadBufferSize:   4096,
 	WriteBufferSize:  4096,
 	CheckOrigin:      func(*http.Request) bool { return true },
 }
 
-// handleCameraWS handles GET /ws/camera/{id}. The access token travels in the
-// token query parameter because WebSocket clients cannot set headers.
-func (s *server) handleCameraWS(w http.ResponseWriter, r *http.Request) {
-	cameraID := chi.URLParam(r, "id")
+// deviceRegisterRequest is the JSON body of GET /ws/register.
+type deviceRegisterRequest struct {
+	DeviceID string                `json:"device_id"`
+	Cameras  []ws.CameraCapability `json:"cameras"`
+}
 
-	if _, err := s.auth.WSUpgradeAuth(r); err != nil {
-		w.Header().Set("WWW-Authenticate", `Bearer realm="teamusers"`)
-		writeProblem(w, r, http.StatusUnauthorized, "websocket authentication failed")
-		slog.Warn("websocket authentication failed", "camera_id", cameraID, "error", err)
+// deviceRegisterResponse is the ticket returned by GET /ws/register.
+type deviceRegisterResponse struct {
+	DeviceWebsocketID string    `json:"device_websocket_id"`
+	ExpiresAt         time.Time `json:"expires_at"`
+	WebsocketPath     string    `json:"websocket_path"`
+}
+
+// handleDeviceRegister handles GET /ws/register. The device presents its
+// long-lived token and its camera parameters and receives a single-use
+// WebSocket ticket.
+func (s *Server) handleDeviceRegister(w http.ResponseWriter, r *http.Request) {
+	var req deviceRegisterRequest
+	if !decodeJSON(w, r, &req) {
 		return
 	}
-	if _, err := s.store.Camera.Get(r.Context(), cameraID); err != nil {
-		writeStoreError(w, r, err, fmt.Sprintf("camera %q not found", cameraID))
+
+	token, ok := auth.DeviceTokenFromRequest(r)
+	if !ok {
+		writeDeviceAuthFailure(w, r)
 		return
 	}
 
-	conn, err := cameraUpgrader.Upgrade(w, r, nil)
+	device, err := s.store.Devices.Get(r.Context(), req.DeviceID)
+	switch {
+	case err == nil:
+	case errors.Is(err, store.ErrNotFound):
+		writeDeviceAuthFailure(w, r)
+		return
+	default:
+		slog.Error("load device for registration", "device_id", req.DeviceID, "error", err)
+		writeProblem(w, r, http.StatusInternalServerError, "internal server error")
+		return
+	}
+
+	// Compare hashes so neither an unknown device nor a wrong token leaks
+	// whether the device exists.
+	if subtle.ConstantTimeCompare(device.TokenHash, auth.HashDeviceToken(token)) != 1 {
+		writeDeviceAuthFailure(w, r)
+		return
+	}
+
+	if err := validateCameraCapabilities(req.Cameras); err != nil {
+		writeProblem(w, r, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	reg, err := s.registry.Create(device.ID, req.Cameras)
 	if err != nil {
-		// Upgrade already sent an HTTP error response.
-		slog.Warn("websocket upgrade failed", "camera_id", cameraID, "error", err)
+		slog.Error("issue device websocket ticket", "device_id", device.ID, "error", err)
+		writeProblem(w, r, http.StatusInternalServerError, "internal server error")
 		return
 	}
 
-	client := ws.NewClient(cameraID, conn, s.hub)
+	if err := s.store.Devices.Touch(r.Context(), device.ID, time.Now().UTC()); err != nil {
+		slog.Error("touch device", "device_id", device.ID, "error", err)
+	}
+
+	writeJSON(w, http.StatusOK, deviceRegisterResponse{
+		DeviceWebsocketID: reg.WebsocketID,
+		ExpiresAt:         reg.ExpiresAt,
+		WebsocketPath:     "/ws/device/" + reg.WebsocketID,
+	})
+}
+
+// handleDeviceWS handles GET /ws/device/{device_websocket_id}. The ticket is
+// consumed by the upgrade and bound to exactly one connection.
+func (s *Server) handleDeviceWS(w http.ResponseWriter, r *http.Request) {
+	websocketID := chi.URLParam(r, "device_websocket_id")
+
+	reg, ok := s.registry.Get(websocketID)
+	if !ok {
+		writeProblem(w, r, http.StatusNotFound, "device websocket not found")
+		return
+	}
+	// A ticket already bound to the device's live session cannot be replayed.
+	// Attach stays the single point of truth for the race-free case below.
+	if current, ok := s.registry.Current(reg.DeviceID); ok && current.WebsocketID == websocketID {
+		writeProblem(w, r, http.StatusConflict, "device websocket ticket already attached")
+		return
+	}
+
+	conn, err := deviceUpgrader.Upgrade(w, r, nil)
+	if err != nil {
+		// Upgrade already wrote an HTTP error response.
+		slog.Warn("device websocket upgrade failed", "device_id", reg.DeviceID, "error", err)
+		return
+	}
+
+	client := ws.NewClient(reg.DeviceID, conn, s.hub)
+	if _, ok := s.registry.Attach(websocketID, client); !ok {
+		// The ticket was already consumed by another connection.
+		slog.Warn("device websocket ticket already attached", "device_id", reg.DeviceID)
+		_ = conn.WriteControl(websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.ClosePolicyViolation, "ticket already attached"),
+			time.Now().Add(wsHandshakeTimeout))
+		_ = conn.Close()
+		return
+	}
+
 	s.hub.Register(client)
-	s.setCameraStatus(cameraID, domain.CameraStatusOnline)
+	if err := s.store.Devices.Touch(r.Context(), reg.DeviceID, time.Now().UTC()); err != nil {
+		slog.Error("touch device", "device_id", reg.DeviceID, "error", err)
+	}
 
 	go client.WritePump()
-	// ReadPump blocks until the connection closes and unregisters the client.
+	// ReadPump blocks until the connection closes.
 	client.ReadPump()
 
-	// Only the newest connection owns a camera's status: a reconnect may have
-	// replaced this one while it was shutting down.
-	if s.hub.GetClient(cameraID) == nil {
-		s.setCameraStatus(cameraID, domain.CameraStatusOffline)
-		// Close any in-flight frame accumulators so they flush and exit.
-		s.stopCameraAccumulators(cameraID)
+	// The ticket is single-use: it dies with the connection. Releasing it never
+	// clears a newer ticket or session of the same device.
+	s.registry.Release(websocketID)
+
+	// Only the newest connection of a device finalizes its recordings; a
+	// replaced connection must leave the live session's media alone.
+	if current, ok := s.hub.Client(reg.DeviceID); ok && current == client {
+		ctx, cancel := context.WithTimeout(context.Background(), deviceDrainTimeout)
+		s.media.StopDevice(ctx, reg.DeviceID)
+		cancel()
 	}
+	s.hub.Remove(client)
 }
 
-// stopCameraAccumulators closes the done channel of every accumulator tied to
-// an active stream on cameraID. Called on camera disconnect to drain buffered
-// frames.
-func (s *server) stopCameraAccumulators(cameraID string) {
-	ctx, cancel := context.WithTimeout(context.Background(), statusWriteTimeout)
-	defer cancel()
-
-	streams, err := s.store.Stream.ListByCamera(ctx, cameraID, 100)
-	if err != nil {
-		slog.Error("list streams for accumulator cleanup", "camera_id", cameraID, "error", err)
-		return
+// validateCameraCapabilities enforces the registration rules: cameras are
+// numbered 0..n-1 in order, each declaring a resolution, a positive frame rate
+// and at least one codec from the closed vocabulary (ws.SupportedCodecNames)
+// without duplicates. Registration is the only gate, so a live registration
+// never carries an unknown or repeated codec.
+func validateCameraCapabilities(cameras []ws.CameraCapability) error {
+	if len(cameras) == 0 {
+		return errors.New("cameras must not be empty")
 	}
-
-	s.accMu.Lock()
-	defer s.accMu.Unlock()
-	for _, st := range streams {
-		if st.Status != domain.StreamStatusActive {
-			continue
+	for i, cam := range cameras {
+		switch {
+		case cam.CameraEnum != i:
+			return fmt.Errorf("cameras[%d].camera_enum must be %d", i, i)
+		case strings.TrimSpace(cam.Resolution) == "":
+			return fmt.Errorf("cameras[%d].resolution must not be empty", i)
+		case cam.FPS <= 0:
+			return fmt.Errorf("cameras[%d].fps must be positive", i)
+		case len(cam.SupportedCodec) == 0:
+			return fmt.Errorf("cameras[%d].supported_codec must not be empty", i)
 		}
-		if acc, ok := s.streamAccumulators[st.ID]; ok {
-			acc.stopAndDrain()
-			delete(s.streamAccumulators, st.ID)
+		// Every element must come from the closed vocabulary, and no codec may
+		// be listed twice.
+		seen := make(map[string]struct{}, len(cam.SupportedCodec))
+		for j, codec := range cam.SupportedCodec {
+			if !ws.IsSupportedCodec(codec) {
+				return fmt.Errorf("cameras[%d].supported_codec[%d] must be one of %s", i, j, strings.Join(ws.SupportedCodecNames(), ", "))
+			}
+			seen[codec] = struct{}{}
+		}
+		if len(seen) != len(cam.SupportedCodec) {
+			return fmt.Errorf("cameras[%d].supported_codec must not contain duplicates", i)
 		}
 	}
+	return nil
 }
 
-// setCameraStatus stores the connection status of a camera. Errors are logged:
-// the status is informative and never fails the connection itself.
-func (s *server) setCameraStatus(cameraID string, status domain.CameraStatus) {
-	ctx, cancel := context.WithTimeout(context.Background(), statusWriteTimeout)
-	defer cancel()
-
-	if err := s.store.Camera.UpdateStatus(ctx, cameraID, status); err != nil && !errors.Is(err, store.ErrNotFound) {
-		slog.Error("update camera status", "camera_id", cameraID, "status", status, "error", err)
-	}
+// writeDeviceAuthFailure writes the single 401 response shared by every device
+// token failure, so an unknown device and a bad token are indistinguishable.
+func writeDeviceAuthFailure(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("WWW-Authenticate", `Bearer realm="device"`)
+	writeProblem(w, r, http.StatusUnauthorized, "device authentication failed")
 }
