@@ -43,6 +43,10 @@ createdb webcam
 export WEBCAM_DB_URL='postgres://<user>:<password>@127.0.0.1:5432/webcam?sslmode=disable'
 ```
 
+The service keeps its tables in the `smartclass_webcam_server` schema, which it
+creates and uses on startup, so `public` is left untouched and needs no special
+privileges. Inspect the tables with `SET search_path TO smartclass_webcam_server;`.
+
 A local server usually runs with `sslmode=disable`; deployed environments use
 `sslmode=require` (see the [deployment guide](/guide/deploy#first-time-setup)).
 

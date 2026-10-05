@@ -12,7 +12,9 @@ run their own host management.
 ## Prerequisites
 
 - **PostgreSQL 16 or newer.** The service owns one database and applies its embedded schema migrations on
-  every startup, so no external migration tool is required.
+  every startup, so no external migration tool is required. Its tables live in the fixed
+  `smartclass_webcam_server` schema, which the service creates itself, so the database role needs no
+  privileges on `public`.
 - **A teamusers IAM instance.** Operators sign in there, and the service validates every management call
   against it. The service keeps no local accounts and never stores user passwords. The `cam:read`,
   `cam:manage`, and `cam:control` keys must be registered in its catalog; see
@@ -81,7 +83,14 @@ Security notes:
    export WEBCAM_DB_URL='postgres://webcam:<password>@127.0.0.1:5432/webcam?sslmode=require'
    ```
 
-   The schema is applied automatically on the next startup.
+   The schema is applied automatically on the next startup. Tables live in the `smartclass_webcam_server`
+   schema, not `public`: the service creates that schema itself, so the role must own the database or
+   hold `CREATE` on it. A DBA can pre-create it instead with
+   `CREATE SCHEMA smartclass_webcam_server AUTHORIZATION <role>;`, in which case the role only needs
+   usage and create rights inside it. Inspecting the tables by hand needs
+   `SET search_path TO smartclass_webcam_server;` first. A database that an older version left in
+   `public` has its tables (including the migration ledger) moved into the schema on the first startup
+   of the new version, keeping the data and not re-running applied migrations.
 
 2. **Prepare object storage.**
 
