@@ -132,6 +132,37 @@ func (s *StreamStore) Finish(ctx context.Context, id string, status domain.Strea
 	return st, nil
 }
 
+// FinalizeOrphans marks every stream still active from an earlier server
+// process as failed and records ended_at. A stream's accumulator lives in
+// process memory only, so after a restart any active row belongs to a dead
+// connection; left alone it would keep blocking new recordings for its
+// camera. Call it at startup, before device connections are accepted.
+func (s *StreamStore) FinalizeOrphans(ctx context.Context) ([]domain.Stream, error) {
+	rows, err := s.pool.Query(ctx, `
+		UPDATE streams
+		SET status = $1, ended_at = COALESCE(ended_at, now())
+		WHERE status = $2
+		RETURNING `+streamColumns,
+		string(domain.StreamStatusFailed), string(domain.StreamStatusActive))
+	if err != nil {
+		return nil, fmt.Errorf("finalize orphaned streams: %w", err)
+	}
+	defer rows.Close()
+
+	streams := make([]domain.Stream, 0)
+	for rows.Next() {
+		st, err := scanStream(rows)
+		if err != nil {
+			return nil, fmt.Errorf("finalize orphaned streams: %w", err)
+		}
+		streams = append(streams, *st)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("finalize orphaned streams: %w", err)
+	}
+	return streams, nil
+}
+
 // scanStream reads one row selected with streamColumns.
 func scanStream(row pgx.Row) (*domain.Stream, error) {
 	var (

@@ -29,7 +29,8 @@ import (
 var version = "dev"
 
 const (
-	// startupTimeout bounds database connection and migration at startup.
+	// startupTimeout bounds database connection, migration and orphan
+	// finalization at startup.
 	startupTimeout = 30 * time.Second
 	// shutdownTimeout is how long in-flight requests get to finish after a
 	// shutdown signal.
@@ -67,6 +68,21 @@ func run() error {
 		return fmt.Errorf("run migrations: %w", err)
 	}
 	slog.Info("database ready")
+
+	// Stream accumulators live only in this process, so every row a previous
+	// process left active is an orphan that would block its camera.
+	st := store.New(pool)
+	orphans, err := st.Streams.FinalizeOrphans(startupCtx)
+	if err != nil {
+		return fmt.Errorf("finalize orphaned streams: %w", err)
+	}
+	if len(orphans) > 0 {
+		ids := make([]string, 0, len(orphans))
+		for _, orphan := range orphans {
+			ids = append(ids, orphan.ID)
+		}
+		slog.Warn("finalized streams left active by a previous process", "count", len(ids), "stream_ids", ids)
+	}
 
 	// Create the authenticator. In dev mode all JWT checks are skipped
 	// and every request is accepted with a synthetic subject. The token
@@ -120,7 +136,7 @@ func run() error {
 
 	srv := &http.Server{
 		Addr:    cfg.ListenAddr,
-		Handler: httpapi.NewRouter(authn, store.New(pool), hub, registry, objStore),
+		Handler: httpapi.NewRouter(authn, st, hub, registry, objStore),
 		// ReadHeaderTimeout only: WebSocket connections are long-lived and
 		// would be cut short by a write timeout.
 		ReadHeaderTimeout: 10 * time.Second,

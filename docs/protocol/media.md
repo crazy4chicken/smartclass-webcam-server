@@ -213,7 +213,8 @@ and finishes as one of the other two.
    (no stream) -----------------------> active ------------------------------> completed
                                           |
                                           |  start command undeliverable (HTTP 502)
-                                          |  or device connection closed
+                                          |  device connection closed
+                                          |  server restarted (finalized at startup)
                                           v
                                         failed
 ```
@@ -224,12 +225,15 @@ and finishes as one of the other two.
 | `recording/start` cannot deliver the command (`502`) | `failed` | Accumulator discarded; buffered frames are drained to storage but the row is still failed. | Set |
 | `recording/stop` succeeds | `completed` | Final flush runs first; if it fails, the error is logged but the stream is still completed. | Set |
 | Device connection closes while it is the current connection | `failed` for every one of its streams | Every accumulator is drained with a final flush (30-second budget), then finished. Streams were not stopped by a command, hence `failed`. | Set |
+| Server process restarts (crash or non-graceful stop) | `failed` for every stream still `active` | None: the accumulators died with the previous process, so buffered frames are lost; segments uploaded earlier remain. Startup finalizes these rows before accepting device connections. | Set |
 | Connection replaced by a newer one for the same device | Unchanged | The replaced connection does not finalize the device's media or touch its live session. | Unchanged |
 
 The finish operation sets `ended_at` only once: a later finish changes `status` but keeps the
 first `ended_at`. Streams are created `active`, never re-activated, and `failed`/`completed`
 streams do not block a new start for the same camera — the uniqueness rule is per device and
-camera over `active` streams only.
+camera over `active` streams only. Streams cannot survive a restart either: startup finalizes
+every still-active row as `failed` before device connections are accepted, because a stream's
+buffered frames live only in the process memory.
 
 ## Photo channel
 
