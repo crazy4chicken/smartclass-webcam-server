@@ -6,19 +6,36 @@ import (
 	"fmt"
 	"path"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 //go:embed migrations/*.sql
 var migrationFiles embed.FS
 
+// schema is the PostgreSQL schema this service owns. Every table lives there
+// instead of public, which deployments commonly restrict, and the pool's
+// search_path points at it so the unqualified names in the store queries and
+// migrations resolve into it.
+const schema = "smartclass_webcam_server"
+
+// ownedTables lists every table the service has ever created. ensureSchema
+// moves them out of public when adopting a database written by a version that
+// still used the default schema.
+var ownedTables = []string{"schema_migrations", "devices", "streams", "stream_segments", "photos", "cameras"}
+
 // NewPool opens a pgx connection pool for dbURL and verifies that the database
-// is reachable.
+// is reachable. Every connection resolves unqualified names through the service
+// schema.
 func NewPool(ctx context.Context, dbURL string) (*pgxpool.Pool, error) {
 	cfg, err := pgxpool.ParseConfig(dbURL)
 	if err != nil {
 		return nil, fmt.Errorf("parse database url: %w", err)
 	}
+	if cfg.ConnConfig.RuntimeParams == nil {
+		cfg.ConnConfig.RuntimeParams = make(map[string]string)
+	}
+	cfg.ConnConfig.RuntimeParams["search_path"] = schema
 
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
@@ -31,10 +48,59 @@ func NewPool(ctx context.Context, dbURL string) (*pgxpool.Pool, error) {
 	return pool, nil
 }
 
-// RunMigrations applies every embedded migration that has not been applied
-// yet. Each file runs in its own transaction and is recorded in
+// ensureSchema creates the service schema and adopts the tables a database
+// written by an older version still holds in public. Both steps are
+// idempotent: the schema is created only when missing, and tables move only
+// into a schema that is still empty, so a database already on the service
+// schema is left alone.
+func ensureSchema(ctx context.Context, pool *pgxpool.Pool) error {
+	if _, err := pool.Exec(ctx,
+		`CREATE SCHEMA IF NOT EXISTS `+pgx.Identifier{schema}.Sanitize()); err != nil {
+		return fmt.Errorf(
+			"create schema %s (the database role needs CREATE on the database, or a DBA can pre-create it with CREATE SCHEMA %s AUTHORIZATION <role>): %w",
+			schema, schema, err)
+	}
+
+	var empty bool
+	if err := pool.QueryRow(ctx,
+		`SELECT NOT EXISTS (SELECT 1 FROM pg_tables WHERE schemaname = $1)`, schema,
+	).Scan(&empty); err != nil {
+		return fmt.Errorf("inspect schema %s: %w", schema, err)
+	}
+	if !empty {
+		return nil
+	}
+
+	rows, err := pool.Query(ctx,
+		`SELECT tablename FROM pg_tables WHERE schemaname = 'public' AND tablename = ANY($1::text[])`,
+		ownedTables)
+	if err != nil {
+		return fmt.Errorf("list tables left in public: %w", err)
+	}
+	legacy, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		return fmt.Errorf("list tables left in public: %w", err)
+	}
+	for _, table := range legacy {
+		// schema_migrations moves along with the rest, so migrations already
+		// applied under public are not re-run.
+		if _, err := pool.Exec(ctx, fmt.Sprintf("ALTER TABLE public.%s SET SCHEMA %s",
+			pgx.Identifier{table}.Sanitize(), pgx.Identifier{schema}.Sanitize())); err != nil {
+			return fmt.Errorf("move table %s into schema %s: %w", table, schema, err)
+		}
+	}
+	return nil
+}
+
+// RunMigrations creates the service schema, adopts tables a previous version
+// left in public, and applies every embedded migration that has not been
+// applied yet. Each file runs in its own transaction and is recorded in
 // schema_migrations, so calling RunMigrations more than once is safe.
 func RunMigrations(ctx context.Context, pool *pgxpool.Pool) error {
+	if err := ensureSchema(ctx, pool); err != nil {
+		return err
+	}
+
 	if _, err := pool.Exec(ctx, `
 		CREATE TABLE IF NOT EXISTS schema_migrations (
 			version    TEXT PRIMARY KEY,
