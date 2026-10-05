@@ -58,7 +58,7 @@ func writeSpec(path string, operations []apidocs.Operation) error {
 
 	options := apidocs.EmitOptions{
 		Title:   "SmartClass Webcam Server API",
-		Version: "0.2.0",
+		Version: "0.2.1",
 		Servers: []apidocs.Server{{
 			URL:         "http://localhost:8080",
 			Description: "Local server (default WEBCAM_LISTEN_ADDR)",
