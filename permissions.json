@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "registered_by": "smartclass-webcam-server",
+  "permissions": [
+    { "key": "cam:read:any", "description": "查看全部设备及其流、录制片段和照片" },
+    { "key": "cam:read:team", "description": "查看本团队设备及其流、录制片段和照片（按 team_id 过滤）" },
+    { "key": "cam:read:own", "description": "查看自己拥有的设备及其流、录制片段和照片（按 owner_id 过滤）" },
+    { "key": "cam:manage:any", "description": "管理全部设备：创建、更新、删除设备，轮换设备令牌" },
+    { "key": "cam:manage:team", "description": "管理本团队设备：更新、删除、轮换令牌，且只能为本人所在团队创建设备" },
+    { "key": "cam:manage:own", "description": "管理自己拥有的设备：更新、删除、轮换令牌，创建的设备归本人所有" },
+    { "key": "cam:control:any", "description": "控制全部设备：切换摄像头、开始/停止录制、拍照" },
+    { "key": "cam:control:team", "description": "控制本团队设备：切换摄像头、开始/停止录制、拍照" },
+    { "key": "cam:control:own", "description": "控制自己拥有的设备：切换摄像头、开始/停止录制、拍照" }
+  ]
+}
