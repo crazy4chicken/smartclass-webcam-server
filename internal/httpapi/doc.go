@@ -213,13 +213,20 @@ func docError(status int, code, title string) apidocs.ErrorDoc {
 	return apidocs.ErrorDoc{Status: status, Code: code, Title: title}
 }
 
+// docForbidden builds the 403 problem an operation documents. The endpoint
+// answers "permission denied" followed by every key its ladder tried and the
+// cause the check reported; the :any key is always tried first, so the example
+// names it.
+func docForbidden(action string) apidocs.ErrorDoc {
+	return docError(403, "permission denied: cam:"+action+":any (no matching grant)", "Forbidden")
+}
+
 var (
 	docInvalidBody       = docError(400, "invalid JSON request body", "Invalid Request")
 	docBodyTooLarge      = docError(413, "request body too large", "Request Entity Too Large")
 	docBadLimit          = docError(400, "limit must be a positive integer", "Invalid Request")
 	docUnauthorized      = docError(401, "authentication failed", "Unauthorized")
 	docDeviceAuthFailed  = docError(401, "device authentication failed", "Unauthorized")
-	docForbidden         = docError(403, "insufficient_permissions", "Forbidden")
 	docDeviceNotFound    = docError(404, "device not found", "Not Found")
 	docStreamNotFound    = docError(404, "stream not found", "Not Found")
 	docPhotoNotFound     = docError(404, "photo not found", "Not Found")
@@ -426,13 +433,13 @@ var DocOperations = []apidocs.Operation{
 	},
 
 	{
-		Method:      "GET",
-		Path:        "/ws/register",
-		Tag:         "WebSocket",
-		Summary:     "Register a device",
-		Description: "Use from a device agent to announce its cameras and obtain a single-use WebSocket ticket. The device token travels in the Authorization header because this call carries a JSON body; an unknown device and a wrong token answer the same 401 so the endpoint never leaks which devices exist. Camera parameters live only in the registration: camera_enum must be exactly 0..n-1 in the order given, resolution must not be empty, fps must be positive and supported_codec must be non-empty with every element one of " + strings.Join(ws.SupportedCodecNames(), ", ") + ". Registering again invalidates the device's previous unused ticket, and the returned device_websocket_id expires after the configured ticket TTL when it is never redeemed.",
-		Request:     docRegisterRequest{},
-		RequestExample: registerRequestExample,
+		Method:          "GET",
+		Path:            "/ws/register",
+		Tag:             "WebSocket",
+		Summary:         "Register a device",
+		Description:     "Use from a device agent to announce its cameras and obtain a single-use WebSocket ticket. The device token travels in the Authorization header because this call carries a JSON body; an unknown device and a wrong token answer the same 401 so the endpoint never leaks which devices exist. Camera parameters live only in the registration: camera_enum must be exactly 0..n-1 in the order given, resolution must not be empty, fps must be positive and supported_codec must be non-empty with every element one of " + strings.Join(ws.SupportedCodecNames(), ", ") + ". Registering again invalidates the device's previous unused ticket, and the returned device_websocket_id expires after the configured ticket TTL when it is never redeemed.",
+		Request:         docRegisterRequest{},
+		RequestExample:  registerRequestExample,
 		Response:        docRegisterResponse{},
 		ResponseExample: registerResponseExample,
 		Errors: []apidocs.ErrorDoc{
@@ -466,7 +473,7 @@ var DocOperations = []apidocs.Operation{
 		Security:        "bearerAuth",
 		Response:        listResponse[domain.Device]{},
 		ResponseExample: map[string]any{"items": []any{deviceExample}},
-		Errors:          []apidocs.ErrorDoc{docBadLimit, docUnauthorized, docForbidden, docInternalFailure},
+		Errors:          []apidocs.ErrorDoc{docBadLimit, docUnauthorized, docForbidden("read"), docInternalFailure},
 	},
 	{
 		Method:      "POST",
@@ -488,7 +495,7 @@ var DocOperations = []apidocs.Operation{
 			docError(400, "team_id and owner_id cannot be set outside your scope", "Invalid Request"),
 			docBodyTooLarge,
 			docUnauthorized,
-			docForbidden,
+			docForbidden("manage"),
 			docInternalFailure,
 		},
 	},
@@ -501,7 +508,7 @@ var DocOperations = []apidocs.Operation{
 		Security:        "bearerAuth",
 		Response:        docDeviceDetail{},
 		ResponseExample: deviceDetailExample,
-		Errors:          []apidocs.ErrorDoc{docUnauthorized, docForbidden, docDeviceNotFound, docInternalFailure},
+		Errors:          []apidocs.ErrorDoc{docUnauthorized, docForbidden("read"), docDeviceNotFound, docInternalFailure},
 	},
 	{
 		Method:      "PUT",
@@ -523,7 +530,7 @@ var DocOperations = []apidocs.Operation{
 			docError(400, "name must not be empty", "Invalid Request"),
 			docBodyTooLarge,
 			docUnauthorized,
-			docForbidden,
+			docForbidden("manage"),
 			docDeviceNotFound,
 			docInternalFailure,
 		},
@@ -535,18 +542,18 @@ var DocOperations = []apidocs.Operation{
 		Summary:     "Delete a device",
 		Description: "Use to remove a device together with every stream, segment and photo recorded for it. A live connection is closed and any pending ticket is invalidated. The response has no body; deleting an unknown device answers 404 and changes nothing.",
 		Security:    "bearerAuth",
-		Errors:      []apidocs.ErrorDoc{docUnauthorized, docForbidden, docDeviceNotFound, docInternalFailure},
+		Errors:      []apidocs.ErrorDoc{docUnauthorized, docForbidden("manage"), docDeviceNotFound, docInternalFailure},
 	},
 	{
-		Method:      "POST",
-		Path:        "/api/devices/{device_id}/token",
-		Tag:         "Devices",
-		Summary:     "Rotate the device token",
-		Description: "Use to replace a device's token. The old token stops working immediately, pending registration tickets are invalidated and the device's live WebSocket connection is closed, so the device must re-register with the new token; the new plaintext token is returned once in this response. The request has no body.",
-		Security:    "bearerAuth",
+		Method:          "POST",
+		Path:            "/api/devices/{device_id}/token",
+		Tag:             "Devices",
+		Summary:         "Rotate the device token",
+		Description:     "Use to replace a device's token. The old token stops working immediately, pending registration tickets are invalidated and the device's live WebSocket connection is closed, so the device must re-register with the new token; the new plaintext token is returned once in this response. The request has no body.",
+		Security:        "bearerAuth",
 		Response:        docDeviceToken{},
 		ResponseExample: deviceTokenExample,
-		Errors:          []apidocs.ErrorDoc{docUnauthorized, docForbidden, docDeviceNotFound, docInternalFailure},
+		Errors:          []apidocs.ErrorDoc{docUnauthorized, docForbidden("manage"), docDeviceNotFound, docInternalFailure},
 	},
 
 	{
@@ -566,7 +573,7 @@ var DocOperations = []apidocs.Operation{
 			docCameraEnumUnknown,
 			docBodyTooLarge,
 			docUnauthorized,
-			docForbidden,
+			docForbidden("control"),
 			docDeviceNotFound,
 			docDeviceOffline,
 			docCommandFailed,
@@ -574,11 +581,11 @@ var DocOperations = []apidocs.Operation{
 		},
 	},
 	{
-		Method:      "POST",
-		Path:        "/api/devices/{device_id}/recording/start",
-		Tag:         "Streams",
-		Summary:     "Start a recording stream",
-		Description: "Use to begin recording one camera of a device. The camera enum is validated against the device's current registration (400 when unknown, 409 when the device has no live session) and a stream must not already be active for that camera (409 otherwise). The server creates the stream row first — snapshotting the camera's resolution, fps and codec list into its metadata — then tells the device to start pushing frames and stores each uploaded chunk as a segment in object storage. The request answers 201 Created with the new stream and its URL in the Location header; a stream whose start command cannot be delivered is marked failed.",
+		Method:          "POST",
+		Path:            "/api/devices/{device_id}/recording/start",
+		Tag:             "Streams",
+		Summary:         "Start a recording stream",
+		Description:     "Use to begin recording one camera of a device. The camera enum is validated against the device's current registration (400 when unknown, 409 when the device has no live session) and a stream must not already be active for that camera (409 otherwise). The server creates the stream row first — snapshotting the camera's resolution, fps and codec list into its metadata — then tells the device to start pushing frames and stores each uploaded chunk as a segment in object storage. The request answers 201 Created with the new stream and its URL in the Location header; a stream whose start command cannot be delivered is marked failed.",
 		Security:        "bearerAuth",
 		Request:         docCameraCommandRequest{},
 		RequestExample:  map[string]any{"camera_enum": 0},
@@ -590,7 +597,7 @@ var DocOperations = []apidocs.Operation{
 			docCameraEnumUnknown,
 			docBodyTooLarge,
 			docUnauthorized,
-			docForbidden,
+			docForbidden("control"),
 			docDeviceNotFound,
 			docDeviceOffline,
 			docStreamActive,
@@ -599,11 +606,11 @@ var DocOperations = []apidocs.Operation{
 		},
 	},
 	{
-		Method:      "POST",
-		Path:        "/api/devices/{device_id}/recording/stop",
-		Tag:         "Streams",
-		Summary:     "Stop the active stream",
-		Description: "Use to end a camera's active recording. The device is told to stop and buffered frames are flushed to object storage before the response is sent, so every segment of the finished recording is visible once this call returns. The request answers 200 with the stream marked completed; a camera that has no active stream answers 404.",
+		Method:          "POST",
+		Path:            "/api/devices/{device_id}/recording/stop",
+		Tag:             "Streams",
+		Summary:         "Stop the active stream",
+		Description:     "Use to end a camera's active recording. The device is told to stop and buffered frames are flushed to object storage before the response is sent, so every segment of the finished recording is visible once this call returns. The request answers 200 with the stream marked completed; a camera that has no active stream answers 404.",
 		Security:        "bearerAuth",
 		Request:         docCameraCommandRequest{},
 		RequestExample:  map[string]any{"camera_enum": 0},
@@ -614,7 +621,7 @@ var DocOperations = []apidocs.Operation{
 			docError(400, "camera_enum is required", "Invalid Request"),
 			docBodyTooLarge,
 			docUnauthorized,
-			docForbidden,
+			docForbidden("control"),
 			docDeviceNotFound,
 			docStreamNotFound,
 			docDeviceOffline,
@@ -639,7 +646,7 @@ var DocOperations = []apidocs.Operation{
 			docCameraEnumUnknown,
 			docBodyTooLarge,
 			docUnauthorized,
-			docForbidden,
+			docForbidden("control"),
 			docDeviceNotFound,
 			docDeviceOffline,
 			docCommandFailed,
@@ -656,7 +663,7 @@ var DocOperations = []apidocs.Operation{
 		Security:        "bearerAuth",
 		Response:        listResponse[domain.Stream]{},
 		ResponseExample: map[string]any{"items": []any{streamExample, completedStreamExample}},
-		Errors:          []apidocs.ErrorDoc{docBadLimit, docUnauthorized, docForbidden, docDeviceNotFound, docInternalFailure},
+		Errors:          []apidocs.ErrorDoc{docBadLimit, docUnauthorized, docForbidden("read"), docDeviceNotFound, docInternalFailure},
 	},
 	{
 		Method:          "GET",
@@ -667,7 +674,7 @@ var DocOperations = []apidocs.Operation{
 		Security:        "bearerAuth",
 		Response:        listResponse[domain.Photo]{},
 		ResponseExample: map[string]any{"items": []any{photoExample}},
-		Errors:          []apidocs.ErrorDoc{docBadLimit, docUnauthorized, docForbidden, docDeviceNotFound, docInternalFailure},
+		Errors:          []apidocs.ErrorDoc{docBadLimit, docUnauthorized, docForbidden("read"), docDeviceNotFound, docInternalFailure},
 	},
 	{
 		Method:          "GET",
@@ -678,7 +685,7 @@ var DocOperations = []apidocs.Operation{
 		Security:        "bearerAuth",
 		Response:        docStreamDetail{},
 		ResponseExample: streamDetailExample,
-		Errors:          []apidocs.ErrorDoc{docBadLimit, docUnauthorized, docForbidden, docStreamNotFound, docInternalFailure},
+		Errors:          []apidocs.ErrorDoc{docBadLimit, docUnauthorized, docForbidden("read"), docStreamNotFound, docInternalFailure},
 	},
 	{
 		Method:          "GET",
@@ -689,7 +696,7 @@ var DocOperations = []apidocs.Operation{
 		Security:        "bearerAuth",
 		Response:        listResponse[domain.StreamSegment]{},
 		ResponseExample: map[string]any{"items": []any{segmentExample}},
-		Errors:          []apidocs.ErrorDoc{docBadLimit, docUnauthorized, docForbidden, docStreamNotFound, docInternalFailure},
+		Errors:          []apidocs.ErrorDoc{docBadLimit, docUnauthorized, docForbidden("read"), docStreamNotFound, docInternalFailure},
 	},
 	{
 		Method:          "GET",
@@ -700,6 +707,6 @@ var DocOperations = []apidocs.Operation{
 		Security:        "bearerAuth",
 		Response:        docPhotoDetail{},
 		ResponseExample: photoDetailExample,
-		Errors:          []apidocs.ErrorDoc{docUnauthorized, docForbidden, docPhotoNotFound, docInternalFailure},
+		Errors:          []apidocs.ErrorDoc{docUnauthorized, docForbidden("read"), docPhotoNotFound, docInternalFailure},
 	},
 }

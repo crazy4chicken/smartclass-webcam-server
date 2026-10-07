@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
+	"strings"
 
 	iam "github.com/crazy4chicken/nsc-teamusers/sdk/go"
 
@@ -50,7 +52,8 @@ func withGrant(ctx context.Context, grant AccessGrant) context.Context {
 // collection. The permission ladder mirrors the teamusers admin resolver: the
 // literal "any" scope is tried first, then "team" and "own" when the caller
 // carries a team or subject. The matching scope is stored in the request
-// context for collection filtering.
+// context for collection filtering; a denial answers 403 with every key that
+// was tried and the cause each check reported.
 func (a *Auth) RequireCollection(action string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -64,9 +67,9 @@ func (a *Auth) RequireCollection(action string) func(http.Handler) http.Handler 
 				return
 			}
 
-			grant, allowed := a.grantCollection(r.Context(), claims, action)
+			grant, reason, allowed := a.grantCollection(r.Context(), claims, action)
 			if !allowed {
-				writeForbidden(w, r)
+				writeForbidden(w, r, reason)
 				return
 			}
 			next.ServeHTTP(w, r.WithContext(withGrant(r.Context(), grant)))
@@ -76,8 +79,9 @@ func (a *Auth) RequireCollection(action string) func(http.Handler) http.Handler 
 
 // RequireDevice returns middleware that authorizes action against the device
 // returned by load. A missing device becomes 404, a load failure 500, and a
-// denied permission 403. The matching scope and the loaded device are stored in
-// the request context.
+// denied permission 403 with every key that was tried and the cause each check
+// reported. The matching scope and the loaded device are stored in the request
+// context.
 func (a *Auth) RequireDevice(action string, load func(*http.Request) (*domain.Device, error)) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -107,14 +111,38 @@ func (a *Auth) RequireDevice(action string, load func(*http.Request) (*domain.De
 				return
 			}
 
-			grant, allowed := a.grantDevice(r.Context(), claims, action, device)
+			grant, reason, allowed := a.grantDevice(r.Context(), claims, action, device)
 			if !allowed {
-				writeForbidden(w, r)
+				writeForbidden(w, r, reason)
 				return
 			}
 			next.ServeHTTP(w, r.WithContext(withGrant(r.Context(), grant)))
 		})
 	}
+}
+
+// rung is one step of a permission ladder: the scope to request and the
+// resource identity that scope selects.
+type rung struct {
+	scope    string
+	resource iam.Resource
+}
+
+// grant walks the rungs in order and returns the first scope the caller may
+// use. When every rung denies, it returns the cause each check reported as
+// "cam:<action>:<scope> (<reason>)" entries joined with "; ", so the endpoint
+// can name the keys that failed and why.
+func (a *Auth) grant(ctx context.Context, claims iam.Claims, action string, rungs []rung) (string, string, bool) {
+	reasons := make([]string, 0, len(rungs))
+	for _, candidate := range rungs {
+		key := permissionKey(action, candidate.scope)
+		allowed, reason := a.client.Allow(ctx, claims, key, candidate.resource)
+		if allowed {
+			return candidate.scope, "", true
+		}
+		reasons = append(reasons, fmt.Sprintf("%s (%s)", key, reason))
+	}
+	return "", strings.Join(reasons, "; "), false
 }
 
 // grantCollection evaluates the ladder of collection permission keys and
@@ -124,40 +152,38 @@ func (a *Auth) RequireDevice(action string, load func(*http.Request) (*domain.De
 // SDK requires a non-empty resource team before a :team key or a team-scoped
 // grant can match, and ABAC conditions then see the same identity the resolved
 // scope filters the collection by.
-func (a *Auth) grantCollection(ctx context.Context, claims iam.Claims, action string) (AccessGrant, bool) {
-	if a.allows(ctx, claims, action, ScopeAny, iam.Resource{}) {
-		return AccessGrant{Scope: ScopeAny, Claims: claims}, true
+func (a *Auth) grantCollection(ctx context.Context, claims iam.Claims, action string) (AccessGrant, string, bool) {
+	rungs := []rung{{scope: ScopeAny}}
+	if claims.Team != "" {
+		rungs = append(rungs, rung{scope: ScopeTeam, resource: iam.Resource{TeamID: claims.Team}})
 	}
-	if claims.Team != "" && a.allows(ctx, claims, action, ScopeTeam, iam.Resource{TeamID: claims.Team}) {
-		return AccessGrant{Scope: ScopeTeam, Claims: claims}, true
+	if claims.Subject != "" {
+		rungs = append(rungs, rung{scope: ScopeOwn, resource: iam.Resource{OwnerID: claims.Subject}})
 	}
-	if claims.Subject != "" && a.allows(ctx, claims, action, ScopeOwn, iam.Resource{OwnerID: claims.Subject}) {
-		return AccessGrant{Scope: ScopeOwn, Claims: claims}, true
+	scope, reason, allowed := a.grant(ctx, claims, action, rungs)
+	if !allowed {
+		return AccessGrant{}, reason, false
 	}
-	return AccessGrant{}, false
+	return AccessGrant{Scope: scope, Claims: claims}, "", true
 }
 
 // grantDevice evaluates the ladder of device permission keys and returns the
 // first matching scope. The team and own keys are only tried when the device's
 // team or owner matches the caller.
-func (a *Auth) grantDevice(ctx context.Context, claims iam.Claims, action string, device *domain.Device) (AccessGrant, bool) {
+func (a *Auth) grantDevice(ctx context.Context, claims iam.Claims, action string, device *domain.Device) (AccessGrant, string, bool) {
 	resource := iam.Resource{OwnerID: device.OwnerID, TeamID: device.TeamID}
-	if a.allows(ctx, claims, action, ScopeAny, resource) {
-		return AccessGrant{Scope: ScopeAny, Claims: claims, Device: device}, true
+	rungs := []rung{{scope: ScopeAny, resource: resource}}
+	if device.TeamID != "" && claims.Team == device.TeamID {
+		rungs = append(rungs, rung{scope: ScopeTeam, resource: resource})
 	}
-	if device.TeamID != "" && claims.Team == device.TeamID && a.allows(ctx, claims, action, ScopeTeam, resource) {
-		return AccessGrant{Scope: ScopeTeam, Claims: claims, Device: device}, true
+	if device.OwnerID != "" && claims.Subject == device.OwnerID {
+		rungs = append(rungs, rung{scope: ScopeOwn, resource: resource})
 	}
-	if device.OwnerID != "" && claims.Subject == device.OwnerID && a.allows(ctx, claims, action, ScopeOwn, resource) {
-		return AccessGrant{Scope: ScopeOwn, Claims: claims, Device: device}, true
+	scope, reason, allowed := a.grant(ctx, claims, action, rungs)
+	if !allowed {
+		return AccessGrant{}, reason, false
 	}
-	return AccessGrant{}, false
-}
-
-// allows reports whether claims grant cam:<action>:<scope> for resource.
-func (a *Auth) allows(ctx context.Context, claims iam.Claims, action, scope string, resource iam.Resource) bool {
-	allowed, _ := a.client.Allow(ctx, claims, permissionKey(action, scope), resource)
-	return allowed
+	return AccessGrant{Scope: scope, Claims: claims, Device: device}, "", true
 }
 
 // permissionKey builds the cam:<action>:<scope> permission key.
@@ -183,8 +209,13 @@ type decisionResponse struct {
 }
 
 // writeForbidden rejects a request whose claims do not grant the permission.
-func writeForbidden(w http.ResponseWriter, r *http.Request) {
-	writeProblem(w, r, http.StatusForbidden, "permission denied")
+// reason names every key the ladder tried and the cause each check reported.
+func writeForbidden(w http.ResponseWriter, r *http.Request, reason string) {
+	detail := "permission denied"
+	if reason != "" {
+		detail += ": " + reason
+	}
+	writeProblem(w, r, http.StatusForbidden, detail)
 }
 
 // problemResponse mirrors the RFC 9457 problem body written by the httpapi

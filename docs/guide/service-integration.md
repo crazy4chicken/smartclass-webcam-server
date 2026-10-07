@@ -37,7 +37,8 @@ key grammar are documented in
 
 A missing or invalid token answers `401`; a token without a matching grant
 answers `403` with an RFC 9457 `application/problem+json` body whose `detail` is
-`permission denied`.
+`permission denied` followed by every key the ladder tried and the cause each
+check reported.
 
 ## Finding streams
 

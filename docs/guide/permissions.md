@@ -225,7 +225,11 @@ A typical split:
   answers `401`.
 - **Response shape.** A `401` answers with the teamusers decision body
   `{"allow": false, "reason": "..."}`. A `403` from the scope ladder is an RFC 9457 problem detail
-  whose `detail` is `permission denied`.
+  whose `detail` is `permission denied` followed by every key the ladder tried and the cause each
+  check reported - for example
+  `permission denied: cam:read:any (no matching grant); cam:manage:own (condition denied)` - so a
+  denial that comes from a missing grant, a false condition and an unreachable scope reads
+  differently without a look at the service log.
 
 ## Service credential
 

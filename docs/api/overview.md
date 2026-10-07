@@ -78,8 +78,10 @@ and the WebSocket close behavior are in the
 
 Authentication failures are the exception: a `401` carries the teamusers
 decision body `{"allow": false, "reason": "..."}` instead of problem details,
-while a `403` from the scope ladder is a problem detail with `permission denied`
-as its `detail`.
+while a `403` from the scope ladder is a problem detail whose `detail` is
+`permission denied` followed by every key the ladder tried and the cause each
+check reported, e.g.
+`permission denied: cam:read:any (no matching grant); cam:read:own (no matching grant)`.
 
 ## Collections
 

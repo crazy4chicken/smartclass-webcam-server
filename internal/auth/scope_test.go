@@ -2,11 +2,14 @@ package auth
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
 	iam "github.com/crazy4chicken/nsc-teamusers/sdk/go"
+
+	"github.com/crazy4chicken/smartclass-webcam-server/internal/domain"
 )
 
 // newTestAuth returns an Auth whose permission client reads the supplied v2
@@ -71,12 +74,72 @@ func TestGrantCollectionScope(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			a := newTestAuth(t, `{"version":2,"user_id":"u1","perm_ver":7,"grants":`+tc.grants+`}`)
-			grant, ok := a.grantCollection(context.Background(), claims, "read")
+			grant, _, ok := a.grantCollection(context.Background(), claims, "read")
 			if ok != tc.wantOK {
 				t.Fatalf("grantCollection allowed = %v, want %v", ok, tc.wantOK)
 			}
 			if ok && grant.Scope != tc.want {
 				t.Fatalf("scope = %q, want %q", grant.Scope, tc.want)
+			}
+		})
+	}
+}
+
+// okHandler answers 200 so a passing ladder stays observable.
+var okHandler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusOK)
+})
+
+// TestRequireForbiddenDetail pins the body an endpoint answers when the ladder
+// denies: the problem detail names every key that was tried and the cause each
+// check reported.
+func TestRequireForbiddenDetail(t *testing.T) {
+	claims := iam.Claims{Subject: "u1", Team: "t1", Kind: "user", PermVer: 7}
+	empty := `{"version":2,"user_id":"u1","perm_ver":7,"grants":[]}`
+
+	cases := []struct {
+		name string
+		gate func(*Auth) http.Handler
+		want string
+	}{
+		{
+			name: "collection",
+			gate: func(a *Auth) http.Handler {
+				return a.RequireCollection("read")(okHandler)
+			},
+			want: "permission denied: cam:read:any (no matching grant); cam:read:team (no matching grant); cam:read:own (no matching grant)",
+		},
+		{
+			name: "device",
+			gate: func(a *Auth) http.Handler {
+				load := func(*http.Request) (*domain.Device, error) {
+					return &domain.Device{ID: "d1", TeamID: "t1", OwnerID: "u1"}, nil
+				}
+				return a.RequireDevice("control", load)(okHandler)
+			},
+			want: "permission denied: cam:control:any (no matching grant); cam:control:team (no matching grant); cam:control:own (no matching grant)",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a := newTestAuth(t, empty)
+			request := httptest.NewRequest(http.MethodGet, "/api/devices", nil)
+			request = request.WithContext(iam.WithClaims(request.Context(), claims))
+
+			recorder := httptest.NewRecorder()
+			tc.gate(a).ServeHTTP(recorder, request)
+
+			if recorder.Code != http.StatusForbidden {
+				t.Fatalf("status = %d, want %d", recorder.Code, http.StatusForbidden)
+			}
+			var problem struct {
+				Detail string `json:"detail"`
+			}
+			if err := json.Unmarshal(recorder.Body.Bytes(), &problem); err != nil {
+				t.Fatalf("decode problem body %q: %v", recorder.Body.String(), err)
+			}
+			if problem.Detail != tc.want {
+				t.Fatalf("detail = %q, want %q", problem.Detail, tc.want)
 			}
 		})
 	}
