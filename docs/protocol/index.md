@@ -216,6 +216,14 @@ levels:
 
 Failures that reach an `/api` handler are RFC 9457 problem details (`application/problem+json`,
 `type` always `about:blank`); field table, example and auth exceptions: [API overview](/api/overview#errors).
+Two shapes come from the router itself rather than a handler: an unknown path answers `404` with
+detail `no route for <METHOD> <path>`, and a known path called with the wrong method answers `405`
+with detail `method <METHOD> is not allowed on <path>; allowed: <methods>`, repeating the allowed
+methods in the `Allow` header. Server-side failures name the operation: `500` bodies read
+`<operation> failed: <cause>` (for example `list devices failed: ...`, or
+`loading the photo failed: ...` from the authorization middleware) and command sends that cannot be
+queued read `502 sending <command> failed: <cause>`; the cause in a `500` or `502` body is
+sanitized of configured credentials and truncated at 300 bytes.
 
 ### Device-plane HTTP statuses
 
@@ -228,12 +236,20 @@ plain-text `400` (see [Transport](/protocol/transport)).
 | `200` | `GET /ws/register` | Registration accepted; ticket minted | Ticket object |
 | `400` | `GET /ws/register` | Body is not a single JSON object, or a camera rule fails | problem+json |
 | `400` | `GET /ws/device/{ticket}` | Request is not a valid WebSocket handshake | Plain text `Bad Request` |
-| `401` | `GET /ws/register` | Missing/non-`wdt_`/unknown token, or unknown device | problem+json, plus `WWW-Authenticate: Bearer realm="device"` |
+| `401` | `GET /ws/register` | No `Authorization` header, a header without a `Bearer wdt_...` token, or a token/device pair that does not verify | problem+json, plus `WWW-Authenticate: Bearer realm="device"` |
 | `404` | `GET /ws/device/{ticket}` | Ticket unknown or expired | problem+json, `device websocket not found` |
 | `409` | `GET /ws/device/{ticket}` | Ticket is the device's live session and is still attached | problem+json, `device websocket ticket already attached` |
-| `413` | `GET /ws/register` | Body larger than 1 MiB | problem+json |
-| `500` | `GET /ws/register` | Store failure or ticket generation failure | problem+json |
+| `413` | `GET /ws/register` | Body larger than 1 MiB | problem+json, `request body too large` |
+| `500` | `GET /ws/register` | Database failure while loading the device, or ticket generation failure | problem+json, `load device for registration failed: <cause>` / `issue device websocket ticket failed: <cause>` |
 | `101` | `GET /ws/device/{ticket}` | Upgrade succeeded | WebSocket connection |
+
+The `401` detail names the failing check: `the Authorization header is missing`,
+`the Authorization header does not carry a Bearer token`,
+`the Authorization header does not carry a device token`, or
+`the device token is unknown or has been rotated` (shared by an unknown device and a wrong or
+rotated token, so the endpoint never leaks whether a device exists). A `400` from a malformed body
+reads `invalid JSON request body: <cause>` with the decoder message sanitized and truncated at 300
+bytes; camera-rule details are listed in [Registration](/protocol/registration#failure-table).
 
 ### WebSocket-level failures
 

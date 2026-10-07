@@ -128,7 +128,7 @@ the 60-second read deadline - the handler exits and performs the same release, i
 | # | Effect | Detail |
 | --- | --- | --- |
 | 1 | The ticket is dropped | The registration is removed from every index. The ticket answers `404` from now on, regardless of `expires_at`. |
-| 2 | The device is offline | The management plane reports it as offline (`GET /api/devices/{device_id}/` has `online: false`) and command calls answer `409` while it has no live session. |
+| 2 | The device is offline | The management plane reports it as offline (`GET /api/devices/{device_id}/` has `online: false`) and command calls answer `409` while it has no live session, with a detail that names the failing check: `device "..." is offline: no live registration` or `...: no live websocket`. |
 | 3 | Media is drained (only for the newest connection) | Every accumulator of the device is stopped within a 30-second budget, its remaining frames are flushed as a final segment, and each stream is marked `failed`. A connection that was already replaced leaves the live session's media alone. |
 | 4 | The connection is removed from the hub | Later command sends fail; nothing is queued for a disconnected device. |
 | 5 | Later frames are dropped | With the registration gone, frames for any camera are discarded with a `debug` log if they still arrive. |
@@ -317,8 +317,9 @@ Practical guidance:
 - A `409` on attach means some connection still holds the ticket as the live session. Registering
   again and attaching with the *new* ticket replaces that session; the newest connection wins.
 - A persistent `401` on the registration call means the device token no longer works (rotated or
-  the device was deleted). That needs an operator to re-provision the credential; retrying cannot
-  fix it.
+  the device was deleted): the detail reads
+  `the device token is unknown or has been rotated`. That needs an operator to re-provision the
+  credential; retrying cannot fix it.
 - Expect abrupt closures: a replaced connection, a device deletion, a token rotation and a read
   timeout all end the connection without a graceful close handshake, so a `1006` is normal
   operation, not necessarily a bug.

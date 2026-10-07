@@ -27,8 +27,12 @@ Two credential classes share the service; a caller never mixes them.
 - **Management plane** (`/api/...`): a teamusers-issued bearer token whose
   verified claims carry a `cam:<action>:<scope>` permission - `cam:read`,
   `cam:manage` or `cam:control`, scoped to `own`, `team` or `any`. A request
-  without valid claims answers `401`; a token that does not reach the target
-  answers `403`.
+  without valid claims answers `401` with the teamusers decision body
+  `{"allow": false, "reason": "<cause>"}` and a challenge header
+  `WWW-Authenticate: Bearer realm="teamusers", error="<code>",
+  error_description="<cause>"` carrying the same cause, where the cause names
+  the failing check (see [Errors](#errors)); a token that does not reach the
+  target answers `403`.
 - **Device plane** (`/ws/register`, `/ws/device/{device_websocket_id}`): the
   device's long-lived `wdt_...` device token, exchanged for a single-use
   WebSocket ticket that authorizes the connection.
@@ -55,7 +59,7 @@ content type `application/problem+json`:
   "type": "about:blank",
   "title": "Not Found",
   "status": 404,
-  "detail": "device \"01J8Z4W3K5M7Q9R1T3V5X7Z9B1\" not found",
+  "detail": "device not found",
   "instance": "/api/devices/01J8Z4W3K5M7Q9R1T3V5X7Z9B1"
 }
 ```
@@ -72,13 +76,69 @@ Each operation page lists the statuses it can return.
 | `detail` | string | always on this service | Free-form string; the fixed messages are listed on the operation page that returns them. | Human-readable cause. |
 | `instance` | string | when the request URL is available | The request path, e.g. `/api/devices/01J8ZK9WQ7X3YV0M4N5P6Q7R8S/`. | Path of the failing request. |
 
+### Routing and server-side failures
+
+Unknown paths and unsupported methods answer the same problem shape as every
+other error:
+
+| Status | `detail` |
+| --- | --- |
+| `404` | `no route for <METHOD> <path>` - no route matches the request. |
+| `405` | `method <METHOD> is not allowed on <path>; allowed: GET, PUT` - the path is served for other methods, which are also repeated in the `Allow` header. |
+
+Server-side failures name the operation that failed:
+
+- `500` - `<operation> failed: <cause>`, for example `list devices failed: ...`,
+  `create device failed: ...` or `issue device websocket ticket failed: ...`.
+  The authorization middleware writes `loading the <device|stream|photo>
+  failed: <cause>` when it cannot load the resource whose access it authorizes,
+  and a recovered handler panic is `panic: <cause>`.
+- `502` - `sending <command> failed: <cause>` on the device command routes,
+  where `<command>` is `switch_camera`, `start_recording`, `stop_recording` or
+  `take_photo` and the cause is either the classified transport failure
+  (`the device websocket is closed`, `the device websocket send buffer is
+  full`) or the underlying hub error.
+
+The cause in a `500` or `502` body is stripped of the configured credentials
+(database password, teamusers service token and client secret, storage
+credentials) and truncated at 300 bytes with a trailing `...`.
+
+### Recurring detail values
+
+| Status | `detail` |
+| --- | --- |
+| `400` | `invalid JSON request body: <cause>` (sanitized and truncated), `request body must contain a single JSON object`, `camera_enum is required`, `camera_enum <camera_enum> is not registered for device "<device_id>"`, `limit must be a positive integer`. |
+| `404` | `device not found`, `stream not found` and `photo not found` from the middleware that loads the resource being authorized; `stream "<stream_id>" not found`, `photo "<photo_id>" not found` and `no active stream for camera_enum <camera_enum> on device "<device_id>"` from the handlers. |
+| `409` | `device "<device_id>" is offline: no live registration`, `device "<device_id>" is offline: no live websocket`, `camera_enum <camera_enum> is already streaming on device "<device_id>"`, `a device with this id already exists`, `device websocket ticket already attached`. |
+
 The device plane answers its own failures with the same body shape; its statuses
 and the WebSocket close behavior are in the
 [device protocol reference](/protocol/#device-plane-http-statuses).
 
 Authentication failures are the exception: a `401` carries the teamusers
-decision body `{"allow": false, "reason": "..."}` instead of problem details,
-while a `403` from the scope ladder is a problem detail whose `detail` is
+decision body `{"allow": false, "reason": "<cause>"}` instead of problem details,
+plus a `WWW-Authenticate` Bearer challenge that repeats the same cause as
+`error` (`invalid_request` for an unusable header, `invalid_token` for a failed
+verification) and `error_description`. The cause names the failing check:
+
+- a missing, malformed or wrong-scheme `Authorization` header:
+  `the authorization header is missing; send "Authorization: Bearer <access token>"`,
+  `the authorization header must read "Bearer <access token>"`,
+  `the authorization header uses the <scheme> scheme; only Bearer is accepted`,
+  `the authorization header carries an empty bearer token`,
+  `the authorization header carries more than the bearer token`;
+- a token the verifier rejected: `access token is expired`,
+  `access token is not valid yet (nbf claim)`,
+  `access token audience is not "<audience>"` (the configured
+  `WEBCAM_TEAMUSERS_AUD`, default `teamusers`),
+  `access token issuer is not "teamusers"`,
+  `access token signature matches no key in the issuer's JWKS document`,
+  `access token names a signing key the issuer does not publish (kid "...")`,
+  `access token is not a valid JWS: ...`,
+  `the issuer's JWKS document is unavailable: ...`.
+
+Any other verifier failure is echoed as reported, sanitized and truncated. A
+`403` from the scope ladder is a problem detail whose `detail` is
 `permission denied` followed by every key the ladder tried and the cause each
 check reported, e.g.
 `permission denied: cam:read:any (no matching grant); cam:read:own (no matching grant)`.

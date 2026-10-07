@@ -50,7 +50,7 @@ Content-Type: application/json
 
 | Header | Required | Allowed values | Notes |
 | --- | --- | --- | --- |
-| `Authorization` | Yes | `Bearer` or `bearer` + one or more spaces/tabs + a device token: the literal `wdt_` followed by 43 base64url characters (`A-Z`, `a-z`, `0-9`, `-`, `_`; 32 random bytes, no padding). Nothing else is accepted. | Grammar: the header is split on whitespace and must yield exactly two fields, the first equal to `bearer` (case-insensitive) and the second starting with the literal `wdt_` (case-sensitive). Anything else is treated as no token at all. |
+| `Authorization` | Yes | `Bearer` or `bearer` + one or more spaces/tabs + a device token: the literal `wdt_` followed by 43 base64url characters (`A-Z`, `a-z`, `0-9`, `-`, `_`; 32 random bytes, no padding). Nothing else is accepted. | Grammar: the header is split on whitespace and must yield exactly two fields, the first equal to `bearer` (case-insensitive) and the second starting with the literal `wdt_` (case-sensitive). Anything else is treated as no token at all, and the `401` detail names which part of the grammar failed (see [Missing or malformed token](#missing-or-malformed-token)). |
 | `Content-Type` | No | Any string; the value the service documents and sends is `application/json`. | Not validated by the server; the body is decoded as JSON regardless of this header. Send `application/json` so proxies and logs see the correct type. |
 | `Content-Length` / `Transfer-Encoding` | Yes | Standard HTTP framing; the body is a single JSON object of at most 1 MiB (1048576 bytes). | Normal HTTP framing rules apply. |
 
@@ -193,15 +193,17 @@ The handler applies its checks in this order, so the first failure wins:
 
 1. **Body decoding** - malformed JSON, a non-object body, more than one JSON value, or a body over
    1 MiB (`400` / `413`). This happens before authentication.
-2. **Token extraction** - a missing or non-`wdt_` bearer token answers `401`.
-3. **Device lookup** - an unknown `device_id` answers the same `401`; a database error answers
-   `500`.
+2. **Token extraction** - a missing, non-`Bearer` or non-`wdt_` token answers `401` with a detail
+   naming which of the three checks failed.
+3. **Device lookup** - an unknown `device_id` answers the same `401` a wrong token answers; a
+   database error answers `500 load device for registration failed: <cause>`.
 4. **Token comparison** - the SHA-256 hash of the presented token is compared in constant time
-   with the stored hash; a mismatch answers the same `401`.
+   with the stored hash; a mismatch answers the same duplicate-safe `401`.
 5. **Camera rules** - the `cameras` array is validated per element (`400`), in the order
    `camera_enum`, `resolution`, `fps`, then `supported_codec` (non-empty, then per-element
    membership, then duplicates); the first failure wins.
-6. **Ticket minting** - a failure here answers `500`.
+6. **Ticket minting** - a failure here answers
+   `500 issue device websocket ticket failed: <cause>`.
 
 Because authentication precedes camera validation, an invalid token hides camera errors; because
 decoding precedes authentication, a malformed body with an invalid token still answers `400`.
@@ -214,11 +216,13 @@ decoding precedes authentication, a malformed body with an invalid token still a
 
 | Condition | Status | `detail` |
 | --- | --- | --- |
-| Body is not valid JSON, or not a single JSON value | `400` | `invalid JSON request body: <decoder message>` |
+| Body is not valid JSON, or not a single JSON value | `400` | `invalid JSON request body: <cause>` (the decoder message, sanitized and truncated at 300 bytes) |
 | Body holds more than one JSON value | `400` | `request body must contain a single JSON object` |
 | Body larger than 1 MiB | `413` | `request body too large` |
-| Missing, malformed or non-`wdt_` `Authorization` header | `401` | `device authentication failed` |
-| Unknown `device_id`, or token hash mismatch | `401` | `device authentication failed` |
+| No `Authorization` header | `401` | `the Authorization header is missing` |
+| Header is not two whitespace-separated fields whose first is `Bearer` | `401` | `the Authorization header does not carry a Bearer token` |
+| Token does not start with `wdt_` | `401` | `the Authorization header does not carry a device token` |
+| Unknown `device_id`, or token hash mismatch | `401` | `the device token is unknown or has been rotated` |
 | `cameras` empty or `null` | `400` | `cameras must not be empty` |
 | `cameras[i].camera_enum` is not `i` (gap, duplicate, reorder) | `400` | `cameras[i].camera_enum must be i` |
 | `cameras[i].resolution` empty or whitespace-only | `400` | `cameras[i].resolution must not be empty` |
@@ -226,7 +230,8 @@ decoding precedes authentication, a malformed body with an invalid token still a
 | `cameras[i].supported_codec` missing or empty | `400` | `cameras[i].supported_codec must not be empty` |
 | `cameras[i].supported_codec[j]` is not one of the seven accepted values | `400` | `cameras[i].supported_codec[j] must be one of h264, h265, mjpeg, mpeg4, vp8, vp9, av1` |
 | `cameras[i].supported_codec` contains a duplicate value | `400` | `cameras[i].supported_codec must not contain duplicates` |
-| Database failure while loading the device or minting the ticket | `500` | `internal server error` |
+| Database failure while loading the device | `500` | `load device for registration failed: <cause>` |
+| Failure while minting the ticket | `500` | `issue device websocket ticket failed: <cause>` |
 
 The `401` response also carries `WWW-Authenticate: Bearer realm="device"`. All other listed
 responses are `application/problem+json` with no extra headers; the `413` body is the standard
@@ -447,8 +452,8 @@ problem document with the listed `detail` (`cameras[i]` uses the failing element
 
 ### Missing or malformed token
 
-No `Authorization` header, a header that is not `Bearer`, or a token that does not start with
-`wdt_` all answer the same way:
+No `Authorization` header, a header that is not `Bearer`, and a token that does not start with
+`wdt_` all answer with the same status and headers, and the `detail` names which check failed:
 
 ```http
 HTTP/1.1 401 Unauthorized
@@ -456,21 +461,43 @@ Content-Type: application/problem+json
 WWW-Authenticate: Bearer realm="device"
 ```
 
+| Header sent | `detail` |
+| --- | --- |
+| *(absent)* | `the Authorization header is missing` |
+| `Basic dXNlcjpwYXNz` or `Bearer` alone | `the Authorization header does not carry a Bearer token` |
+| `Bearer <any token without the wdt_ prefix>` | `the Authorization header does not carry a device token` |
+
+For example, a request with no `Authorization` header:
+
 ```json
 {
   "type": "about:blank",
   "title": "Unauthorized",
   "status": 401,
-  "detail": "device authentication failed",
+  "detail": "the Authorization header is missing",
   "instance": "/ws/register"
 }
 ```
 
+The header value itself is never echoed, only the reason it was unusable.
+
 ### Wrong token or unknown device
 
-A token that has the right shape but does not match the stored hash, and a `device_id` that does
-not exist, produce the *identical* `401` body above. The endpoint never reveals whether a device
-exists.
+A `Bearer wdt_...` token that does not match the stored hash and a `device_id` that does not exist
+answer identically:
+
+```json
+{
+  "type": "about:blank",
+  "title": "Unauthorized",
+  "status": 401,
+  "detail": "the device token is unknown or has been rotated",
+  "instance": "/ws/register"
+}
+```
+
+Any well-formed pair whose token does not verify produces that one detail, so the endpoint never
+reveals whether a device exists or whether its token was rotated.
 
 ### Oversized body
 
@@ -494,8 +521,8 @@ Content-Type: application/problem+json
 
 ### Malformed JSON
 
-A truncated or syntactically invalid body answers `400` and quotes the decoder error. Body, shown
-verbatim:
+A truncated or syntactically invalid body answers `400` and quotes the decoder error, with
+configured secrets replaced by `[redacted]` and the text cut at 300 bytes. Body, shown verbatim:
 
 ```text
 {
@@ -535,7 +562,9 @@ verbatim:
 ```
 
 The same applies to a nested field: `"fps": "30"` answers with
-`invalid JSON request body: json: cannot unmarshal string into Go struct field deviceRegisterRequest.cameras.0.fps of type int`.
+`invalid JSON request body: json: cannot unmarshal string into Go struct field CameraCapability.cameras.fps of type int`
+(the struct name is the camera element's type, and the decoder names the JSON path without the
+array index).
 
 ### Two JSON documents
 

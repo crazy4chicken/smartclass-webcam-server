@@ -391,7 +391,8 @@ Body rules, as enforced by the shared decode helper:
 - The body is limited to 1 MiB; a larger body answers `413` with `request body too large`.
 - Unknown fields inside the object are ignored.
 - Malformed JSON, or `camera_enum` missing entirely, answers `400`: malformed bodies produce
-  `invalid JSON request body: <decoder error>`, a body without the key produces exactly
+  `invalid JSON request body: <cause>`, where the decoder message is sanitized of configured
+  secrets and truncated at 300 bytes, and a body without the key produces exactly
   `camera_enum is required`.
 
 ### Success shapes
@@ -480,15 +481,17 @@ Only the recording endpoints touch the database: `recording/start` inserts the s
 
 | Condition | Status | `detail` in the problem body | State left behind |
 | --- | --- | --- | --- |
-| Body not a single JSON object, or `camera_enum` not an integer | `400` | decoder message, or `camera_enum is required` when the key is absent | None |
+| Body not a single JSON object, or `camera_enum` not an integer | `400` | `invalid JSON request body: <cause>` (sanitized and truncated at 300 bytes), or `camera_enum is required` when the key is absent | None |
 | Body larger than 1 MiB | `413` | `request body too large` | None |
 | `camera_enum` not in the current registration (switch, start, photo) | `400` | `camera_enum 2 is not registered for device "01J8ZK9WQ7X3YV0M4N5P6Q7R8S"` | None |
-| Device has no live session (switch, start, photo), or the command send finds it gone | `409` | `device "01J8ZK9WQ7X3YV0M4N5P6Q7R8S" is offline` | None |
+| `device_id` does not exist (loading the device before authorization) | `404` | `device not found` | None |
+| Device has no live registration at all (switch, start, photo) | `409` | `device "01J8ZK9WQ7X3YV0M4N5P6Q7R8S" is offline: no live registration` | None |
+| Registration exists but no websocket is attached (all four, including a send that finds the connection gone) | `409` | `device "01J8ZK9WQ7X3YV0M4N5P6Q7R8S" is offline: no live websocket` | None |
 | `recording/start` while that camera already has an `active` stream | `409` | `camera_enum 0 is already streaming on device "01J8ZK9WQ7X3YV0M4N5P6Q7R8S"` | No new row; the existing stream is untouched |
 | `recording/stop` with no `active` stream for that camera | `404` | `no active stream for camera_enum 0 on device "01J8ZK9WQ7X3YV0M4N5P6Q7R8S"` | None |
-| Command cannot be queued: outbound buffer full or connection closing | `502` | `device connection is unavailable` | `start`: the new stream is drained and immediately finished as `failed`. The other three: nothing changed — in particular a stop that fails this way leaves its stream `active` |
-| Caller token missing, invalid or lacking `cam:control:<scope>` | `401` / `403` | management-plane body (see [API Overview](/api/overview)) | None |
-| Store failure during the operation | `500` | `internal server error` | Depends on where the failure happened; the request is abandoned |
+| Command cannot be queued | `502` | `sending <command> failed: <cause>` - `<command>` is `switch_camera`, `start_recording`, `stop_recording` or `take_photo`, and the cause is `the device websocket is closed`, `the device websocket send buffer is full`, or the underlying hub error (sanitized and truncated at 300 bytes) | `start`: the new stream is drained and immediately finished as `failed`. The other three: nothing changed — in particular a stop that fails this way leaves its stream `active` |
+| Caller token missing, invalid or lacking `cam:control:<scope>` | `401` / `403` | management-plane body (see [API Overview](/api/overview#errors)) | None |
+| Store failure during the operation | `500` | `<operation> failed: <cause>` with the operation from `loading the device`, `create stream`, `find active stream` or `finish stream` (sanitized and truncated at 300 bytes) | Depends on where the failure happened; the request is abandoned |
 
 Notes on the ordering and the side effects:
 
@@ -504,14 +507,15 @@ Notes on the ordering and the side effects:
 - Failures reported by the device (`ack` with `ok: false`) are **not** HTTP failures. The HTTP
   response was already written when the command was queued, so it is never changed retroactively.
 
-The problem body is RFC 9457, `Content-Type: application/problem+json`:
+The problem body is RFC 9457, `Content-Type: application/problem+json` (this one from a
+`camera/switch` for a device that has not registered):
 
 ```json
 {
   "type": "about:blank",
   "title": "Conflict",
   "status": 409,
-  "detail": "device \"01J8ZK9WQ7X3YV0M4N5P6Q7R8S\" is offline",
+  "detail": "device \"01J8ZK9WQ7X3YV0M4N5P6Q7R8S\" is offline: no live registration",
   "instance": "/api/devices/01J8ZK9WQ7X3YV0M4N5P6Q7R8S/camera/switch"
 }
 ```

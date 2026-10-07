@@ -35,8 +35,13 @@ reads; there is no separate media-only permission. The scope ladder and the
 key grammar are documented in
 [Permissions and access control](/guide/permissions).
 
-A missing or invalid token answers `401`; a token without a matching grant
-answers `403` with an RFC 9457 `application/problem+json` body whose `detail` is
+A missing or invalid token answers `401` with the teamusers decision body
+`{"allow": false, "reason": "<cause>"}` and a `WWW-Authenticate` Bearer
+challenge that repeats the cause, so a `curl -f` failure names whether the
+header was unusable, the token was expired, the audience or issuer was wrong,
+or no published signing key matched (the full vocabulary is in
+[API Overview](/api/overview#errors)). A token without a matching grant answers
+`403` with an RFC 9457 `application/problem+json` body whose `detail` is
 `permission denied` followed by every key the ladder tried and the cause each
 check reported.
 
