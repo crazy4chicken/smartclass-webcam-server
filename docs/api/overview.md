@@ -107,7 +107,7 @@ credentials) and truncated at 300 bytes with a trailing `...`.
 
 | Status | `detail` |
 | --- | --- |
-| `400` | `invalid JSON request body: <cause>` (sanitized and truncated), `request body must contain a single JSON object`, `camera_enum is required`, `camera_enum <camera_enum> is not registered for device "<device_id>"`, `limit must be a positive integer`. |
+| `400` | `invalid JSON request body: <cause>` (sanitized and truncated), `request body must contain a single JSON object`, `camera_enum is required`, `camera_enum <camera_enum> is not registered for device "<device_id>"`, `resolution "<resolution>" is not supported by camera_enum <camera_enum> on device "<device_id>"` (camera switch), `fps <fps> is not supported by camera_enum <camera_enum> on device "<device_id>"` (camera switch), `codec "<codec>" is not supported by camera_enum <camera_enum> on device "<device_id>"` (recording start), `limit must be a positive integer`. |
 | `404` | `device not found`, `stream not found` and `photo not found` from the middleware that loads the resource being authorized; `stream "<stream_id>" not found`, `photo "<photo_id>" not found` and `no active stream for camera_enum <camera_enum> on device "<device_id>"` from the handlers. |
 | `409` | `device "<device_id>" is offline: no live registration`, `device "<device_id>" is offline: no live websocket`, `camera_enum <camera_enum> is already streaming on device "<device_id>"`, `a device with this id already exists`, `device websocket ticket already attached`. |
 

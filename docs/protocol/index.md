@@ -45,9 +45,12 @@ The management plane is documented in the [API overview](/api/overview) and
 | Server | Authenticates the device, issues tickets, tracks the live session, buffers media to object storage, exposes the management API. |
 | Operator | Uses the management plane to create devices, rotate tokens, trigger commands, and download recordings and photos. |
 
-Camera parameters (`resolution`, `fps`, `supported_codec`, `attrs`) are ephemeral: the device
-announces them on every registration and the server keeps them only in the live registration, never
-in the device record.
+Camera parameters (`resolution`, `fps`, `supported_resolutions`, `supported_framerates`,
+`supported_codec`, `attrs`) are ephemeral: the device announces them on every registration and the
+server keeps them only in the live registration, never in the device record. `resolution` and
+`fps` are the parameters a camera is at for the current connection — a device captures from exactly
+one camera at exactly one resolution and frame rate at a time, and only a `switch_camera` command
+selects another camera or another pair; a device never changes them on its own.
 
 ## Endpoint map
 
@@ -170,7 +173,8 @@ lifetime.
 | Device token format | `wdt_` + 43 base64url characters (32 random bytes, no padding); only its SHA-256 hash is stored | - |
 | Ticket format | 32 random bytes as 64 lowercase hex characters | - |
 | Stream, command, request and photo id format | ULID, 26 characters | - |
-| Default content type of a segment, and of a photo without `content_type` | `application/octet-stream` | - |
+| Content type of a segment object | `application/octet-stream` | - |
+| Content type of a stored photo | `image/jpeg` — an absent photo `content_type` means the canonical one | - |
 
 ## Enumerated values
 
@@ -191,11 +195,13 @@ levels:
 | `camera_enum` (registration) | Integer `0..n-1` only, must equal the element's index in `cameras` | enforced: gaps, duplicates and reorders answer `400 cameras[i].camera_enum must be i` | [Registration](/protocol/registration) |
 | `camera_enum` (commands) | Integer in `0..n-1` of the device's current registration | enforced for `switch_camera`, `start_recording` and `take_photo` (`400` when unregistered); `stop_recording` resolves the camera's active stream instead (`404` when none) | [Control](/protocol/control#operator-http-triggers) |
 | `camera_enum` (media payloads) | JSON number; non-integers truncated toward zero; must match the current registration | enforced: truncation and registration match; mismatches drop the frame or photo | [Media](/protocol/media#frame-payload) |
-| `resolution` | Free-form non-empty string (whitespace-only rejected); `WIDTHxHEIGHT` convention such as `1920x1080`, `1280x720` | enforced non-empty; the format is canonical-only, never parsed | [Registration](/protocol/registration#request) |
-| `fps` | Integer greater than `0` (`1`, `2`, `3`, ...); fractions are decode errors | enforced: zero, negative and missing answer `400` | [Registration](/protocol/registration#request) |
-| `supported_codec` | Non-empty array of strings; every element exactly one of `h264`, `h265`, `mjpeg`, `mpeg4`, `vp8`, `vp9`, `av1` (FFmpeg-style lowercase names, case-sensitive: `H264` and the alias `hevc` are rejected), no duplicates | enforced closed set: an unknown value answers `400 cameras[i].supported_codec[j] must be one of h264, h265, mjpeg, mpeg4, vp8, vp9, av1`, a duplicate answers `400 cameras[i].supported_codec must not contain duplicates`; no normalisation, no negotiation; extending the vocabulary requires a server change | [Codec values](/protocol/registration#codec-values) |
+| `resolution` | Free-form non-empty string (whitespace-only rejected); `WIDTHxHEIGHT` convention such as `1920x1080`, `1280x720`. The value a camera is at must be one of its `supported_resolutions` (compared after trimming) | enforced: non-empty and membership in the trimmed `supported_resolutions` (`400 cameras[i].resolution must be one of the supported_resolutions`); a switch may only select a listed value, otherwise `400 resolution "<resolution>" is not supported by camera_enum <camera_enum> on device "<device_id>"` | [Registration](/protocol/registration#cameras), [Control](/protocol/control#switch-camera) |
+| `fps` | Integer greater than `0` (`1`, `2`, `3`, ...); fractions are decode errors. The value a camera is at must be one of its `supported_framerates` | enforced: positivity and membership in `supported_framerates` (`400 cameras[i].fps must be one of the supported_framerates`); a switch may only select a listed value, otherwise `400 fps <fps> is not supported by camera_enum <camera_enum> on device "<device_id>"` | [Registration](/protocol/registration#cameras), [Control](/protocol/control#switch-camera) |
+| `supported_resolutions` | Non-empty array of strings; entries are trimmed, empty ones are rejected, duplicates (after trimming) are rejected, and the camera's current `resolution` must appear in the list | enforced: non-empty, per-entry emptiness, duplicates, membership of `resolution` | [Supported parameters](/protocol/registration#supported-parameters) |
+| `supported_framerates` | Non-empty array of integers, every entry `> 0`, no duplicates; the camera's current `fps` must appear in the list | enforced: non-empty, per-entry positivity, duplicates, membership of `fps` | [Supported parameters](/protocol/registration#supported-parameters) |
+| `supported_codec` | Non-empty array of strings; every element exactly one of `h264`, `h265`, `mjpeg`, `mpeg4`, `vp8`, `vp9`, `av1` (FFmpeg-style lowercase names, case-sensitive: `H264` and the alias `hevc` are rejected), no duplicates. The first entry is the preferred codec of the camera | enforced closed set: an unknown value answers `400 cameras[i].supported_codec[j] must be one of h264, h265, mjpeg, mpeg4, vp8, vp9, av1`, a duplicate answers `400 cameras[i].supported_codec must not contain duplicates`; a `recording/start` codec outside the announced list answers `400 codec "<codec>" is not supported by camera_enum <camera_enum> on device "<device_id>"`; no normalisation, no negotiation; extending the vocabulary requires a server change | [Codec values](/protocol/registration#codec-values) |
 | `attrs` | Any JSON object | free-form: kept in the live registration, never validated, never persisted | [Registration](/protocol/registration#request) |
-| `content_type` (photo) | Any non-empty string stored verbatim; canonical `image/jpeg`; empty or non-string falls back to the default | free-form value; the `application/octet-stream` default is enforced | [Media](/protocol/media#photo-payload) |
+| `content_type` (photo) | `image/jpeg` (trimmed, case-insensitive) or absent; empty or non-string counts as absent | enforced JPEG-only: absent means the canonical `image/jpeg`, any other value discards the photo with no record | [Media](/protocol/media#photo-payload) |
 | `seq` | Any JSON number; non-integers truncated toward zero; absent or non-number counts as `0` | enforced truncation and default | [Media](/protocol/media#frame-payload) |
 | `ts` (server `ping`) | RFC3339Nano UTC timestamp from the server clock, e.g. `2026-10-04T10:00:30Z` | enforced: the server formats it; always present on a `ping` | [Control](/protocol/control#ping) |
 | `ts` (media payloads) | RFC3339Nano string; malformed, non-string or missing is treated as absent (`frame`) or replaced by the server's receive time (`photo`) | enforced fallback | [Media](/protocol/media#frame-payload) |
@@ -316,7 +322,8 @@ operator                     server                          device agent
 
 1. Store the `device_id` and the `wdt_` device token; treat the token as a credential. Send the
    full camera set (`camera_enum` `0..n-1`) to `GET /ws/register` on every startup and after every
-   reconnect.
+   reconnect, announcing each camera's current `resolution` and `fps` together with the
+   `supported_resolutions`, `supported_framerates` and `supported_codec` lists it accepts.
 2. Parse `expires_at` with a full RFC 3339 parser: it is Go `time.Time` JSON and normally carries
    sub-second precision. Do not assume whole seconds.
 3. Attach with `GET /ws/device/{device_websocket_id}` before the ticket expires. On `404`
@@ -334,8 +341,9 @@ operator                     server                          device agent
 9. Tag recording frames with the `stream_id` from `start_recording` and with a `camera_enum` from
    your current registration; send `seq` monotonically and a `ts` in RFC 3339 (nanosecond
    precision recommended).
-10. Send the `request_id` from `take_photo` on the matching photo frame, and set a real image
-    `content_type` such as `image/jpeg`; the default `application/octet-stream` is a fallback.
+10. Send the `request_id` from `take_photo` on the matching photo frame. Photos are always JPEG:
+    set `content_type` to `image/jpeg` or omit it — an absent value means the canonical one — and
+    never send another value, which makes the server discard the photo with no record.
 11. Ignore unknown message types and channels instead of failing: the server may add new ones. On
     the server side, unknown control types and unknown media channels are logged at `debug` and
     ignored.
@@ -345,3 +353,10 @@ operator                     server                          device agent
     close handshake. Reconnect with exponential backoff rather than a tight loop.
 14. Do not push media for streams the server has not announced, and stop pushing as soon as a
     `stop_recording` for that stream is acknowledged.
+15. Keep your cameras at the parameters you announced: capture from exactly one camera at exactly
+    one resolution and frame rate, and change them only when a `switch_camera` command names new
+    values from your `supported_resolutions` / `supported_framerates` lists — a device never
+    changes them on its own.
+16. Record with the `codec` a `start_recording` command names when it is present, otherwise with
+    your preferred codec — the first entry of `supported_codec`. A codec can be requested only
+    there, never on a switch or a photo.

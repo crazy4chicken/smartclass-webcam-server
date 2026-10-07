@@ -35,26 +35,30 @@ no re-delivery and no queue that survives a reconnection.
 
 | Type | Trigger | `id` | Payload keys |
 | --- | --- | --- | --- |
-| `switch_camera` | `POST /api/devices/{device_id}/camera/switch` | ULID (26 characters) | `camera_enum` |
-| `start_recording` | `POST /api/devices/{device_id}/recording/start` | ULID (26 characters) | `camera_enum`, `stream_id` |
+| `switch_camera` | `POST /api/devices/{device_id}/camera/switch` | ULID (26 characters) | `camera_enum`, optionally `resolution` and `fps` |
+| `start_recording` | `POST /api/devices/{device_id}/recording/start` | ULID (26 characters) | `camera_enum`, `stream_id`, optionally `codec` |
 | `stop_recording` | `POST /api/devices/{device_id}/recording/stop` | ULID (26 characters) | `camera_enum`, `stream_id` |
 | `take_photo` | `POST /api/devices/{device_id}/photo` | ULID (26 characters) | `camera_enum`, `request_id` |
 | `ping` | keepalive timer, every 30 seconds | none (absent) | `ts` |
 
 ### `switch_camera`
 
-Makes one camera the device's active camera.
+Makes one camera the device's active camera, optionally at new parameters. A device captures from
+exactly one camera at exactly one resolution and frame rate at a time; only a `switch_camera`
+command selects another camera or another pair, and a device never changes them on its own.
 
 | Field | JSON type | Required | Allowed values | Default | Meaning |
 | --- | --- | --- | --- | --- | --- |
 | `camera_enum` | number | Yes | An integer in `0..n-1` of the camera list the device last announced, e.g. `0` or `1`. The server validates it against the device's current registration before sending, so it always refers to an announced camera; an unregistered value never reaches the device (the HTTP call answers `400`). | — | Camera that must become active. |
+| `resolution` | string | No | One of the selected camera's `supported_resolutions` values, e.g. `1920x1080`. The server trims it and validates it against the camera's registration before sending; a value the camera did not declare never reaches the device (the HTTP call answers `400`). A whitespace-only value counts as absent. | absent | Resolution the camera must switch to; absent keeps the resolution the camera is at. |
+| `fps` | number | No | One of the selected camera's `supported_framerates` values, e.g. `30`. Validated like `resolution`; a value the camera did not declare never reaches the device (the HTTP call answers `400`). | absent | Frame rate the camera must switch to; absent keeps the frame rate it is at. |
 
 ```json
 {
   "channel": "control",
   "type": "switch_camera",
   "id": "01J8ZKQ3B5N7P9R1T3V5X7Z9B1",
-  "payload": {"camera_enum": 1}
+  "payload": {"camera_enum": 1, "resolution": "1280x720", "fps": 15}
 }
 ```
 
@@ -62,9 +66,11 @@ Makes one camera the device's active camera.
   `payload.ok: false` and `payload.error` when the device cannot switch. The server does not wait
   for it.
 - **Device obligations.** Apply the switch to whatever "active camera" means locally (the camera
-  used for the next capture/stream) and answer with an `ack`. There is no server-side
-  active-camera state: the server records nothing about the switch beyond the HTTP response, so
-  the ack is the only confirmation an operator can get.
+  used for the next capture/stream), at the new `resolution` and/or `fps` when they are present,
+  and answer with an `ack`. A parameter that is absent keeps its current value, so a switch to
+  another camera leaves that camera at the parameters it reported in its registration. There is no
+  server-side active-camera state: the server records nothing about the switch beyond the HTTP
+  response, so the ack is the only confirmation an operator can get.
 - **Server state.** None. No record is created or updated.
 
 ### `start_recording`
@@ -75,6 +81,7 @@ Tells the device to start pushing video frames for one camera into one server-cr
 | --- | --- | --- | --- | --- | --- |
 | `camera_enum` | number | Yes | Integer in `0..n-1` of the current registration, validated by the server before sending. | — | Camera to record. |
 | `stream_id` | string | Yes | Opaque server-issued ULID string: 26 uppercase Crockford base32 characters (`0-9A-HJKMNP-TV-Z`), e.g. `01J8ZKQ3B5N7P9R1T3V5X7Z9B2`. Always non-empty and unique per stream; it matches the `id` of the stream row created by the triggering endpoint. | — | Stream that the device must push `recording.frame` messages into. |
+| `codec` | string | No | One element of the camera's `supported_codec` list, exact lowercase, e.g. `h264`. The server trims it and validates it against the camera's registration before sending; a value the camera did not declare never reaches the device (the HTTP call answers `400`). A whitespace-only value counts as absent. | absent | Codec the recording must use; absent leaves the choice to the device, which uses its preferred one — the first entry of `supported_codec`. A codec can be requested only here, never on a `switch_camera` or a photo. |
 
 ```json
 {
@@ -83,23 +90,27 @@ Tells the device to start pushing video frames for one camera into one server-cr
   "id": "01J8ZKQ3B5N7P9R1T3V5X7Z9B1",
   "payload": {
     "camera_enum": 0,
-    "stream_id": "01J8ZKQ3B5N7P9R1T3V5X7Z9B2"
+    "stream_id": "01J8ZKQ3B5N7P9R1T3V5X7Z9B2",
+    "codec": "h264"
   }
 }
 ```
 
 - **Ack expectation.** An `ack` echoing `id`, `ok: true` when the encoder is running, `ok: false`
   and `error` when it cannot start. The server does not wait for it.
-- **Device obligations.** Start encoding `camera_enum` and send `recording.frame` binary frames
-  whose `stream_id` and `camera_enum` are exactly these values ([Media
+- **Device obligations.** Start encoding `camera_enum` at the camera's current resolution and frame
+  rate — a recording never changes them — with `codec` when it is present, otherwise with the
+  device's preferred codec (the first entry of `supported_codec`). Send `recording.frame` binary
+  frames whose `stream_id` and `camera_enum` are exactly these values ([Media
   Channels](/protocol/media)). Keep sending until a `stop_recording` for the same `stream_id`
   arrives or the connection closes. Frames may be sent before the ack — the server registers the
   stream's frame accumulator **before** it queues the command, so nothing is lost in that race.
 - **Server state.** The triggering endpoint has already inserted the stream row with `status:
-  "active"` and registered its frame accumulator. An `ok: false` ack does **not** change that: the
-  stream stays `active` (and its accumulator stays registered) until an operator stops it, a
-  subsequent command cannot be delivered, or the device disconnects. There is no device-initiated
-  way to end a stream.
+  "active"`, its `metadata` snapshotting the camera's `resolution` and `fps`, the requested `codec`
+  (omitted when none was named) and the camera's whole codec list in `metadata.codecs`, and
+  registered its frame accumulator. An `ok: false` ack does **not** change that: the stream stays
+  `active` (and its accumulator stays registered) until an operator stops it, a subsequent command
+  cannot be delivered, or the device disconnects. There is no device-initiated way to end a stream.
 
 ### `stop_recording`
 
@@ -155,9 +166,11 @@ Asks for one still image.
 - **Ack expectation.** An `ack` echoing `id`: `ok: true` once the capture/upload was accepted,
   `ok: false` and `error` when the camera cannot capture.
 - **Device obligations.** Capture one still from `camera_enum`, then upload it as a `photo.photo`
-  binary frame carrying the same `camera_enum` and `request_id` (plus a real `content_type`, e.g.
-  `image/jpeg`). The photo is stored under a server-generated id; `request_id` is the only link
-  back to this command.
+  binary frame carrying the same `camera_enum` and `request_id`. Still images are always JPEG: set
+  `content_type` to `image/jpeg` or omit it — an absent value means the canonical one — because
+  any other value is discarded by the server and no photo record appears (see
+  [Media Channels](/protocol/media#photo-payload)). The photo is stored under a server-generated
+  id; `request_id` is the only link back to this command.
 - **Server state.** None at command time. The photo record appears only when the device uploads and
   the server finishes storing it (see [Media Channels](/protocol/media)).
 
@@ -333,7 +346,7 @@ received the command.
     | POST /api/devices/{id}/recording/start     |                                   |
     |------------------------------------------->|                                   |
     |                                            | 1. validate body, live session,   |
-    |                                            |    registered camera              |
+    |                                            |    camera + named parameters      |
     |                                            | 2. create side state if any       |
     |                                            |    (stream row, accumulator)      |
     |                                            | 3. queue command (id = new ULID)  |
@@ -347,7 +360,8 @@ received the command.
 
 Detail per step:
 
-1. The endpoint first validates the request, then the live session and the camera (see the
+1. The endpoint first validates the request, then the live session, the camera and — when the
+   request names them — its declared parameters or codec (see the
    [failure table](#failure-semantics)).
 2. Commands that need server-side state create it before queueing: `recording/start` inserts the
    stream row and registers its frame accumulator; the other commands create nothing.
@@ -360,8 +374,9 @@ Detail per step:
 
 ## Operator HTTP triggers
 
-All four endpoints live under `/api`, require a teamusers bearer token with
-`cam:control:<scope>`, and share the same request body. See [Permissions and access
+All four endpoints live under `/api` and require a teamusers bearer token with
+`cam:control:<scope>`. `camera/switch` and `recording/start` take optional parameters besides
+`camera_enum`; `recording/stop` and `photo` take only it. See [Permissions and access
 control](/guide/permissions) for the scope ladder and [API Overview](/api/overview) for the
 authentication model; the generated schemas are in the [API reference](/api/reference/devices).
 
@@ -372,16 +387,39 @@ authentication model; the generated schemas are in the [API reference](/api/refe
 | `POST /api/devices/{device_id}/recording/stop` | `stop_recording` | `200 OK` | completed stream resource |
 | `POST /api/devices/{device_id}/photo` | `take_photo` | `202 Accepted` | `{command_id, request_id, camera_enum}` |
 
-### Request body
+### Request bodies
 
-All four endpoints take the same body:
+`recording/stop` and `photo` take only the camera the command acts on:
 
 | Field | JSON type | Required | Allowed values | Default | Meaning |
 | --- | --- | --- | --- | --- | --- |
-| `camera_enum` | number | Yes | JSON integer in `0..n-1` of the device's current registration, e.g. `0` or `1`. A fractional number or a string is a decode error (`400`); a missing key answers `camera_enum is required`; a value not in the registration answers `400` on switch, start and photo (`recording/stop` instead resolves the camera's active stream and answers `404` when there is none). | — | Target camera. |
+| `camera_enum` | number | Yes | JSON integer in `0..n-1` of the device's current registration, e.g. `0` or `1`. A fractional number or a string is a decode error (`400`); a missing key answers `camera_enum is required`; a value not in the registration answers `400` on photo (`recording/stop` instead resolves the camera's active stream and answers `404` when there is none). | — | Target camera. |
 
 ```json
 {"camera_enum": 0}
+```
+
+`camera/switch` adds the optional parameters the selected camera must switch to:
+
+| Field | JSON type | Required | Allowed values | Default | Meaning |
+| --- | --- | --- | --- | --- | --- |
+| `camera_enum` | number | Yes | As above; a value not in the registration answers `400`. | — | Camera to select. |
+| `resolution` | string | No | One of the selected camera's `supported_resolutions` values, e.g. `1920x1080`: the server trims the request value and compares it exactly against the registered list before sending; anything else answers `400 resolution "<resolution>" is not supported by camera_enum <camera_enum> on device "<device_id>"` and never reaches the device. A whitespace-only value counts as absent. | absent | Resolution to switch the camera to; absent keeps the resolution it is at. |
+| `fps` | number | No | One the selected camera declared in `supported_framerates`; anything else answers `400 fps <fps> is not supported by camera_enum <camera_enum> on device "<device_id>"`. | absent | Frame rate to switch the camera to; absent keeps the frame rate it is at. |
+
+```json
+{"camera_enum": 1, "resolution": "1280x720", "fps": 15}
+```
+
+`recording/start` adds the optional codec the recording must use:
+
+| Field | JSON type | Required | Allowed values | Default | Meaning |
+| --- | --- | --- | --- | --- | --- |
+| `camera_enum` | number | Yes | As above; a value not in the registration answers `400`. | — | Camera to record. |
+| `codec` | string | No | One the camera declared in `supported_codec`, exact lowercase; anything else answers `400 codec "<codec>" is not supported by camera_enum <camera_enum> on device "<device_id>"`. A whitespace-only value counts as absent. | absent — the device uses its preferred codec, the first entry of `supported_codec` | Codec the recording must use; the recorded value lands in the stream's `metadata.codec`. |
+
+```json
+{"camera_enum": 0, "codec": "h264"}
 ```
 
 Body rules, as enforced by the shared decode helper:
@@ -390,10 +428,12 @@ Body rules, as enforced by the shared decode helper:
   `request body must contain a single JSON object`.
 - The body is limited to 1 MiB; a larger body answers `413` with `request body too large`.
 - Unknown fields inside the object are ignored.
-- Malformed JSON, or `camera_enum` missing entirely, answers `400`: malformed bodies produce
+- A missing `camera_enum` answers `400 camera_enum is required`; malformed JSON answers
   `invalid JSON request body: <cause>`, where the decoder message is sanitized of configured
-  secrets and truncated at 300 bytes, and a body without the key produces exactly
-  `camera_enum is required`.
+  secrets and truncated at 300 bytes.
+- The optional `resolution` and `codec` are trimmed before use: a whitespace-only value behaves
+  like an absent field (the device keeps the camera's parameters or uses its preferred codec)
+  rather than answering `400`. The optional `fps` is checked only when the key is present.
 
 ### Success shapes
 
@@ -438,6 +478,7 @@ Fields of both `202` bodies:
   "metadata": {
     "resolution": "1920x1080",
     "fps": 30,
+    "codec": "h264",
     "codecs": ["h264", "h265", "mjpeg"]
   }
 }
@@ -456,6 +497,7 @@ Fields of both `202` bodies:
   "metadata": {
     "resolution": "1920x1080",
     "fps": 30,
+    "codec": "h264",
     "codecs": ["h264", "h265", "mjpeg"]
   }
 }
@@ -471,7 +513,7 @@ Stream resource fields:
 | `status` | string | Always | Exactly one of `active`, `completed`, `failed` (`internal/domain/domain.go`). | Stream lifecycle state; set to `active` on creation. |
 | `started_at` | string | Always | RFC3339 timestamp from the database clock, e.g. `2026-10-04T10:01:00Z`. | Creation time. |
 | `ended_at` | string | When finished | RFC3339 timestamp; written once and kept on later finishes. | Finish time. |
-| `metadata` | object | Always | `resolution`: free-form string as announced (`WIDTHxHEIGHT` convention); `fps`: integer > 0 as announced; `codecs`: array of the announced values, order preserved, each one of `h264`, `h265`, `mjpeg`, `mpeg4`, `vp8`, `vp9`, `av1`; `codec`: schema field that is never set by any code path. | Camera snapshot taken at start. `metadata.codecs` is the announced list, not a negotiated codec — see [Codec values](/protocol/registration#codec-values). |
+| `metadata` | object | Always | `resolution`: free-form string as announced (`WIDTHxHEIGHT` convention); `fps`: integer > 0 as announced; `codecs`: array of the announced values, order preserved, each one of `h264`, `h265`, `mjpeg`, `mpeg4`, `vp8`, `vp9`, `av1`; `codec`: the codec requested at `recording/start`, one of the announced values, omitted when none was named. | Camera snapshot taken at start. `metadata.codecs` is the announced list, not a negotiated codec — see [Codec values](/protocol/registration#codec-values). |
 
 Only the recording endpoints touch the database: `recording/start` inserts the stream row and
 `recording/stop` finishes it. `camera/switch` just asks the device to switch, and `photo` mints a
@@ -484,6 +526,9 @@ Only the recording endpoints touch the database: `recording/start` inserts the s
 | Body not a single JSON object, or `camera_enum` not an integer | `400` | `invalid JSON request body: <cause>` (sanitized and truncated at 300 bytes), or `camera_enum is required` when the key is absent | None |
 | Body larger than 1 MiB | `413` | `request body too large` | None |
 | `camera_enum` not in the current registration (switch, start, photo) | `400` | `camera_enum 2 is not registered for device "01J8ZK9WQ7X3YV0M4N5P6Q7R8S"` | None |
+| `resolution` (switch) not in the selected camera's `supported_resolutions` | `400` | `resolution "1280x720" is not supported by camera_enum 1 on device "01J8ZK9WQ7X3YV0M4N5P6Q7R8S"` | None |
+| `fps` (switch) not in the selected camera's `supported_framerates` | `400` | `fps 60 is not supported by camera_enum 1 on device "01J8ZK9WQ7X3YV0M4N5P6Q7R8S"` | None |
+| `codec` (recording/start) not in the camera's `supported_codec` | `400` | `codec "vp9" is not supported by camera_enum 0 on device "01J8ZK9WQ7X3YV0M4N5P6Q7R8S"` | None |
 | `device_id` does not exist (loading the device before authorization) | `404` | `device not found` | None |
 | Device has no live registration at all (switch, start, photo) | `409` | `device "01J8ZK9WQ7X3YV0M4N5P6Q7R8S" is offline: no live registration` | None |
 | Registration exists but no websocket is attached (all four, including a send that finds the connection gone) | `409` | `device "01J8ZK9WQ7X3YV0M4N5P6Q7R8S" is offline: no live websocket` | None |
@@ -496,9 +541,10 @@ Only the recording endpoints touch the database: `recording/start` inserts the s
 Notes on the ordering and the side effects:
 
 - The checks run in a fixed order: body, then live session (except for stop), then camera
-  registration, then stream state. A missing `camera_enum` therefore answers `400` even when the
-  device is offline, and a stop for a device that has never registered answers `404` (not `409`)
-  because it only looks for an active stream.
+  registration, then the optional parameters or codec the request names, then stream state. A
+  missing `camera_enum` therefore answers `400` even when the device is offline, and a stop for a
+  device that has never registered answers `404` (not `409`) because it only looks for an active
+  stream.
 - `recording/stop` is the exception to the live-session rule: it resolves the active stream first
   and only fails with `409`/`502` when the command itself cannot be delivered. That leaves the
   stream row `active` with its accumulator still running.

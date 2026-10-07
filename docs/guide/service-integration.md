@@ -68,6 +68,7 @@ curl -fsS -H "Authorization: Bearer $TOKEN" \
       "metadata": {
         "resolution": "1920x1080",
         "fps": 30,
+        "codec": "h264",
         "codecs": ["h264", "h265", "mjpeg"]
       }
     }
@@ -77,8 +78,10 @@ curl -fsS -H "Authorization: Bearer $TOKEN" \
 
 A stream carries `id`, `device_id`, `camera_enum`, `status` (`active`,
 `completed`, or `failed`), `started_at`, `ended_at` (absent while the stream is
-active), and `metadata` - the `resolution`, `fps`, and `codecs` announced by the
-device when the recording started.
+active), and `metadata` - the camera's `resolution` and `fps` at the time of the
+start, the codec the request named in `codec` (omitted when it named none, in
+which case the device recorded with its preferred codec, the first entry of its
+`supported_codec` list), and every codec the camera supports in `codecs`.
 
 `limit` is optional on every list: the default is `100`, values above `1000`
 are clamped, and a non-positive or non-numeric value is rejected with `400`.
@@ -123,9 +126,11 @@ none), `size_bytes` (length prefixes included), `created_at` (upload time), and
 
 `GET /api/photos/{photo_id}/` returns one photo plus a presigned
 `download_url` with the same per-response, 15-minute semantics as segments. The
-URL serves the image bytes exactly as the device uploaded them; `content_type`
-is stored verbatim from the device (canonically `image/jpeg`) with no sniffing
-or normalization.
+URL serves the image bytes exactly as the device uploaded them. Still images are
+always JPEG: the upload may declare `image/jpeg` (in any casing) or omit the
+content type — an absent value means the canonical one — and any other value
+makes the server discard the photo, so no record appears; every stored photo
+reports `"content_type": "image/jpeg"` with no sniffing or normalization.
 
 A photo's `request_id` correlates it with the `take_photo` command that asked
 for it. There is no lookup-by-`request_id` endpoint, so match it while listing
@@ -148,8 +153,9 @@ S3-compatible endpoint. Objects are laid out as:
 - The segment timestamp is the **flush** time (UTC, second precision), not the
   capture time of the first frame; `first_seq` is the segment's `segment_seq`.
   It normally matches the record's `created_at` second.
-- Photo objects have no file extension; the object's content type carries the
-  format (`Upload` forwards the declared `content_type`).
+- Photo objects have no file extension; the object's content type is always
+  `image/jpeg`, the only type the protocol allows (`Upload` receives the
+  canonical value even when the device omitted or cased it differently).
 - Both layouts are prefix-friendly: `{device_id}/streams/{stream_id}/`
   enumerates one recording and `{device_id}/photos/` one device's images,
   provided the storage API and the consumer's credentials allow listing.
@@ -178,8 +184,10 @@ def frames(blob: bytes):
 
 - There is no container header, no per-frame timestamp, and no checksum; each
   frame is exactly the encoded payload the device sent, in arrival order.
-- **The codec is not recorded.** `metadata.codecs` is the list the device
-  announced at registration, not the codec actually in use. Determine it
+- **The codec is only partly known.** `metadata.codec` records the codec the
+  caller requested at `recording/start`, and when it is absent the device
+  recorded with its preferred codec — the first entry of `metadata.codecs` — so
+  neither field proves what the frames actually contain. Determine the codec
   yourself (for example by inspecting the frame bitstream) or take it from the
   device's configuration, then pick the matching demuxer - an H.264 stream can
   be fed to `ffmpeg -f h264 -i frames.h264 ...`, other codecs need their own.

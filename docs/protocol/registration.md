@@ -33,6 +33,8 @@ Content-Type: application/json
       "camera_enum": 0,
       "resolution": "1920x1080",
       "fps": 30,
+      "supported_resolutions": ["1920x1080", "1280x720"],
+      "supported_framerates": [30, 15],
       "supported_codec": ["h264", "h265", "mjpeg"],
       "attrs": {"label": "front"}
     },
@@ -40,6 +42,8 @@ Content-Type: application/json
       "camera_enum": 1,
       "resolution": "1280x720",
       "fps": 15,
+      "supported_resolutions": ["1280x720"],
+      "supported_framerates": [15],
       "supported_codec": ["mjpeg"]
     }
   ]
@@ -77,10 +81,19 @@ first.
 | Field | JSON type | Required | Default | Allowed values | Meaning |
 | --- | --- | --- | --- | --- | --- |
 | `camera_enum` | integer | Yes | `0` when omitted | Integer in `0..n-1` only, where `n` is the length of `cameras`; it must equal the element's index. A fractional number (e.g. `0.5`) or a string is a decode error (`400`). | Must equal the element's index in the array: `0` for the first camera, `1` for the second, and so on. A gap, a duplicate or a reorder is rejected with `cameras[i].camera_enum must be i`. The value identifies the camera in every later command and media frame. |
-| `resolution` | string | Yes | `""` when omitted | Free-form non-empty string (leading/trailing whitespace is ignored by the check; only a whitespace-only value is rejected). Canonical convention: `WIDTHxHEIGHT` in pixels, e.g. `1920x1080` or `1280x720`. The server never parses it. | The announced value is kept in the live registration and snapshotted into the stream's `metadata.resolution`. |
-| `fps` | integer | Yes | `0` when omitted | Integer greater than `0` (`1`, `2`, `3`, ...). `0`, a negative value or a missing key is rejected with `400`; a JSON fraction such as `29.97` fails decoding with `400` rather than being rounded. | Frames per second the device expects to deliver. Snapshotted into a stream's `metadata.fps` and used to estimate segment durations. |
-| `supported_codec` | array of strings | Yes | `null` when omitted | At least one element, each exactly one of `h264`, `h265`, `mjpeg`, `mpeg4`, `vp8`, `vp9`, `av1` — FFmpeg-style names in exact lowercase, so `H264` and the alias `hevc` are rejected; duplicates are rejected. See [Codec values](#codec-values). | The codecs the device can produce for this camera. Snapshotted into the stream's `metadata.codecs`; the server never negotiates a codec. |
+| `resolution` | string | Yes | `""` when omitted | Free-form non-empty string (leading/trailing whitespace is ignored by the check; only a whitespace-only value is rejected). Canonical convention: `WIDTHxHEIGHT` in pixels, e.g. `1920x1080` or `1280x720`. The server never parses it. | The resolution this camera is **at** for the current connection (not just any value it could produce): it must appear in `supported_resolutions`, compared after trimming, and only a `switch_camera` command can change it. Snapshotted into a stream's `metadata.resolution`. |
+| `fps` | integer | Yes | `0` when omitted | Integer greater than `0` (`1`, `2`, `3`, ...). `0`, a negative value or a missing key is rejected with `400`; a JSON fraction such as `29.97` fails decoding with `400` rather than being rounded. | Frames per second this camera is **at** for the current connection: it must appear in `supported_framerates`, and only a `switch_camera` command can change it. Snapshotted into a stream's `metadata.fps` and used to estimate segment durations. |
+| `supported_resolutions` | array of strings | Yes | `null` when omitted | At least one element. Elements are trimmed before comparison; an empty (or whitespace-only) element is rejected, no value may appear twice (trimming included), and the camera's current `resolution` must be one of the trimmed values. See [Supported parameters](#supported-parameters). | Every resolution this camera accepts; a later `switch_camera` may select only values from this list. Ephemeral like the rest of the camera block. |
+| `supported_framerates` | array of integers | Yes | `null` when omitted | At least one element; every element must be positive, no value may appear twice, and the camera's current `fps` must be one of them. See [Supported parameters](#supported-parameters). | Every frame rate this camera accepts; a later `switch_camera` may select only values from this list. Ephemeral like the rest of the camera block. |
+| `supported_codec` | array of strings | Yes | `null` when omitted | At least one element, each exactly one of `h264`, `h265`, `mjpeg`, `mpeg4`, `vp8`, `vp9`, `av1` — FFmpeg-style names in exact lowercase, so `H264` and the alias `hevc` are rejected; duplicates are rejected. See [Codec values](#codec-values). | The codecs the device can produce for this camera. Snapshotted into the stream's `metadata.codecs`; the first entry is the preferred codec a recording uses when none is requested at `recording/start`. The server never negotiates a codec. |
 | `attrs` | object | No | `{}` when omitted | Any JSON object; free-form keys and values of any JSON type, stored verbatim (never validated, never persisted to the database). | Device-specific data (for example a label). Lives in the registration and is visible through `GET /api/devices/{device_id}/` while the device is online. |
+
+One camera at one pair: `resolution` and `fps` are the parameters a camera is at for the current
+connection, not a free choice. A device captures from exactly one camera at exactly one resolution
+and frame rate at a time, and only a `switch_camera` command selects another camera or another
+pair — a device never changes them on its own (see
+[Control channel](/protocol/control#switch-camera)). `supported_resolutions` and
+`supported_framerates` bound what a switch may later select and must contain the current pair.
 
 Decoder behavior, verified against the implementation:
 
@@ -92,6 +105,49 @@ Decoder behavior, verified against the implementation:
   checks.
 - Arrays and objects must be well formed and types must match exactly: `"fps": "30"` is a decode
   error, not a coercion.
+
+### Supported parameters
+
+Each camera declares the parameters it is at together with the full set it accepts. The two lists
+are independent: `supported_resolutions` lists resolutions, `supported_framerates` lists frame
+rates, and any listed resolution may be combined with any listed frame rate by a later
+`switch_camera` (the protocol defines no pairwise restriction).
+
+Enforcement semantics, exactly as implemented (`internal/httpapi/ws_handler.go`,
+`validateCameraCapabilities`):
+
+- **Both lists must exist and be non-empty.** `[]` and `null` are rejected with `400
+  cameras[i].supported_resolutions must not be empty` and `400
+  cameras[i].supported_framerates must not be empty` respectively.
+- **Resolution elements are trimmed; frame rate elements are not.** A `supported_resolutions`
+  element that is empty or whitespace-only answers `400
+  cameras[i].supported_resolutions[j] must not be empty`; comparison for duplicates and for the
+  current `resolution` happens after trimming, so `"1920x1080"` and `" 1920x1080 "` count as the
+  same value. `supported_framerates` elements are JSON integers: a fraction is a decode error and
+  a value `<= 0` answers `400 cameras[i].supported_framerates[j] must be positive`.
+- **Neither list may contain duplicates** (after trimming, for resolutions): `400
+  cameras[i].supported_resolutions must not contain duplicates` and `400
+  cameras[i].supported_framerates must not contain duplicates`.
+- **The current pair must be listed.** `resolution` must be one of the trimmed
+  `supported_resolutions` values — otherwise `400
+  cameras[i].resolution must be one of the supported_resolutions` — and `fps` must be one of
+  `supported_framerates` — otherwise `400 cameras[i].fps must be one of the supported_framerates`.
+  The check compares trimmed values; it never invents an entry for the device.
+- **Checks run after the non-empty list checks and before the codec checks**, in the order
+  `supported_resolutions` (per-element emptiness, duplicates, membership of `resolution`), then
+  `supported_framerates` (per-element positivity, duplicates, membership of `fps`).
+- **The live registration stores trimmed resolutions.** Validation compares trimmed values, and the
+  accepted registration keeps those trimmed forms — the current `resolution` and every
+  `supported_resolutions` entry — so a later `switch_camera`, which trims its own value too, can
+  select any entry the device listed even if the device announced it padded. Frame rates and codecs
+  are stored exactly as announced.
+- **List order carries no server semantics.** A switch may select any listed value; the server
+  never reorders or intersects the lists.
+
+The validated lists live in the registration only and surface in two places: the `cameras` array
+of `GET /api/devices/{device_id}/` while the device is online, and the `metadata.codecs` snapshot
+taken at `recording/start`. A `switch_camera` may select only values from these lists, and a
+`recording/start` codec must come from `supported_codec`.
 
 ### Codec values
 
@@ -135,11 +191,12 @@ Enforcement semantics, exactly as implemented (`internal/httpapi/ws_handler.go`,
 
 What the server still does **not** do:
 
-- **No negotiation and no recording of a negotiated codec.** `recording/start` copies the
-  announced list into the stream's `metadata.codecs` (`internal/httpapi/commands.go`);
-  `metadata.codec` — a schema field — is never set by any code path
-  (`internal/domain/domain.go`). `metadata.codecs` is a snapshot of the validated announcement,
-  not a codec the server picked.
+- **No negotiation and no verification of the codec in use.** `recording/start` copies the
+  announced list into the stream's `metadata.codecs` and, when the request names one, the
+  requested codec into the stream's `metadata.codec` (`internal/httpapi/commands.go`). It never
+  picks a codec itself: an unnamed codec is left to the device, which records with its preferred
+  one — the first entry of `supported_codec`. Nothing verifies that the frames actually match the
+  requested or preferred codec.
 - **Segment and photo bytes stay opaque.** They are stored byte for byte and never parsed for
   codec information (`internal/httpapi/media.go`); the segment object is uploaded as
   `application/octet-stream`. Nothing checks that the payload bytes match the announced value.
@@ -147,7 +204,9 @@ What the server still does **not** do:
 **Where the announced values surface:** in the live device detail (`cameras` of
 `GET /api/devices/{device_id}/` while the device is online) and in the `metadata.codecs` array
 of the stream resource returned by `recording/start` and the read endpoints. Consumers of
-`metadata.codecs` can rely on every element being exactly one of the seven lowercase values.
+`metadata.codecs` can rely on every element being exactly one of the seven lowercase values. The
+stream's `metadata.codec` field records the codec requested at `recording/start` and is omitted
+when none was named.
 
 **Extending the vocabulary requires a server change.** A device cannot introduce a value outside
 this list (for example `prores`): the accepted set is fixed in the server
@@ -165,6 +224,8 @@ unsupported value:
       "camera_enum": 0,
       "resolution": "1920x1080",
       "fps": 30,
+      "supported_resolutions": ["1920x1080"],
+      "supported_framerates": [30],
       "supported_codec": ["H264", "prores"]
     }
   ]
@@ -200,8 +261,11 @@ The handler applies its checks in this order, so the first failure wins:
 4. **Token comparison** - the SHA-256 hash of the presented token is compared in constant time
    with the stored hash; a mismatch answers the same duplicate-safe `401`.
 5. **Camera rules** - the `cameras` array is validated per element (`400`), in the order
-   `camera_enum`, `resolution`, `fps`, then `supported_codec` (non-empty, then per-element
-   membership, then duplicates); the first failure wins.
+   `camera_enum`, `resolution` non-empty, `supported_resolutions` non-empty, `fps` positive,
+   `supported_framerates` non-empty, `supported_codec` non-empty, then per-element
+   `supported_resolutions` (empty entry, duplicates, then membership of `resolution`),
+   `supported_framerates` (positive entries, duplicates, then membership of `fps`) and
+   `supported_codec` (vocabulary membership, then duplicates); the first failure wins.
 6. **Ticket minting** - a failure here answers
    `500 issue device websocket ticket failed: <cause>`.
 
@@ -226,8 +290,16 @@ decoding precedes authentication, a malformed body with an invalid token still a
 | `cameras` empty or `null` | `400` | `cameras must not be empty` |
 | `cameras[i].camera_enum` is not `i` (gap, duplicate, reorder) | `400` | `cameras[i].camera_enum must be i` |
 | `cameras[i].resolution` empty or whitespace-only | `400` | `cameras[i].resolution must not be empty` |
+| `cameras[i].supported_resolutions` missing or empty | `400` | `cameras[i].supported_resolutions must not be empty` |
 | `cameras[i].fps` missing, zero or negative | `400` | `cameras[i].fps must be positive` |
+| `cameras[i].supported_framerates` missing or empty | `400` | `cameras[i].supported_framerates must not be empty` |
 | `cameras[i].supported_codec` missing or empty | `400` | `cameras[i].supported_codec must not be empty` |
+| `cameras[i].supported_resolutions[j]` empty or whitespace-only | `400` | `cameras[i].supported_resolutions[j] must not be empty` |
+| `cameras[i].supported_resolutions` contains a duplicate value (after trimming) | `400` | `cameras[i].supported_resolutions must not contain duplicates` |
+| `cameras[i].resolution` is not one of the trimmed `supported_resolutions` values | `400` | `cameras[i].resolution must be one of the supported_resolutions` |
+| `cameras[i].supported_framerates[j]` is zero or negative | `400` | `cameras[i].supported_framerates[j] must be positive` |
+| `cameras[i].supported_framerates` contains a duplicate value | `400` | `cameras[i].supported_framerates must not contain duplicates` |
+| `cameras[i].fps` is not one of the `supported_framerates` values | `400` | `cameras[i].fps must be one of the supported_framerates` |
 | `cameras[i].supported_codec[j]` is not one of the seven accepted values | `400` | `cameras[i].supported_codec[j] must be one of h264, h265, mjpeg, mpeg4, vp8, vp9, av1` |
 | `cameras[i].supported_codec` contains a duplicate value | `400` | `cameras[i].supported_codec must not contain duplicates` |
 | Database failure while loading the device | `500` | `load device for registration failed: <cause>` |
@@ -295,6 +367,8 @@ curl -sS -X GET "$WEBCAM_URL/ws/register" \
         "camera_enum": 0,
         "resolution": "1920x1080",
         "fps": 30,
+        "supported_resolutions": ["1920x1080", "1280x720"],
+        "supported_framerates": [30, 15],
         "supported_codec": ["h264", "h265", "mjpeg"],
         "attrs": {"label": "front"}
       },
@@ -302,6 +376,8 @@ curl -sS -X GET "$WEBCAM_URL/ws/register" \
         "camera_enum": 1,
         "resolution": "1280x720",
         "fps": 15,
+        "supported_resolutions": ["1280x720"],
+        "supported_framerates": [15],
         "supported_codec": ["mjpeg"]
       }
     ]
@@ -331,6 +407,8 @@ element would have to exist or this element would have to be `0`:
       "camera_enum": 1,
       "resolution": "1920x1080",
       "fps": 30,
+      "supported_resolutions": ["1920x1080"],
+      "supported_framerates": [30],
       "supported_codec": ["h264"]
     }
   ]
@@ -361,12 +439,16 @@ Two cameras both claim `0`; the second must be `1`:
       "camera_enum": 0,
       "resolution": "1920x1080",
       "fps": 30,
+      "supported_resolutions": ["1920x1080"],
+      "supported_framerates": [30],
       "supported_codec": ["h264"]
     },
     {
       "camera_enum": 0,
       "resolution": "1280x720",
       "fps": 15,
+      "supported_resolutions": ["1280x720"],
+      "supported_framerates": [15],
       "supported_codec": ["mjpeg"]
     }
   ]
@@ -395,6 +477,8 @@ Two cameras both claim `0`; the second must be `1`:
       "camera_enum": 0,
       "resolution": "1920x1080",
       "fps": 30,
+      "supported_resolutions": ["1920x1080"],
+      "supported_framerates": [30],
       "supported_codec": []
     }
   ]
@@ -443,12 +527,58 @@ problem document with the listed `detail` (`cameras[i]` uses the failing element
 | --- | --- |
 | `resolution` set to `"  "` (only whitespace) | `cameras[0].resolution must not be empty` |
 | `resolution` omitted | `cameras[0].resolution must not be empty` |
+| `resolution` set to a value not listed in `supported_resolutions` | `cameras[0].resolution must be one of the supported_resolutions` |
+| `supported_resolutions` set to `[]` or `null` | `cameras[0].supported_resolutions must not be empty` |
+| `supported_resolutions` set to `[""]` or `["  "]` | `cameras[0].supported_resolutions[0] must not be empty` |
+| `supported_resolutions` set to `["1920x1080", " 1920x1080 "]` | `cameras[0].supported_resolutions must not contain duplicates` |
 | `fps` set to `0` | `cameras[0].fps must be positive` |
 | `fps` set to `-5` | `cameras[0].fps must be positive` |
+| `fps` set to a value not listed in `supported_framerates` | `cameras[0].fps must be one of the supported_framerates` |
+| `supported_framerates` set to `[]` or `null` | `cameras[0].supported_framerates must not be empty` |
+| `supported_framerates` set to `[0]` or `[-5]` | `cameras[0].supported_framerates[0] must be positive` |
+| `supported_framerates` set to `[30, 30]` | `cameras[0].supported_framerates must not contain duplicates` |
 | `supported_codec` set to `[]` or `null` | `cameras[0].supported_codec must not be empty` |
 | `supported_codec` set to `["H264"]` or `["prores"]` | `cameras[0].supported_codec[0] must be one of h264, h265, mjpeg, mpeg4, vp8, vp9, av1` |
 | `supported_codec` set to `["h264", "h264"]` | `cameras[0].supported_codec must not contain duplicates` |
 | `camera_enum` omitted on the first camera | Accepted as `0`; the remaining rules still apply |
+
+### Current parameters not in the supported lists
+
+A camera whose `resolution` is not among its `supported_resolutions` — here `1280x720` against a
+list of `["1920x1080"]` — is rejected, because a switch could never select the pair the camera
+claims to be at:
+
+```json
+{
+  "device_id": "01J8ZK9WQ7X3YV0M4N5P6Q7R8S",
+  "cameras": [
+    {
+      "camera_enum": 0,
+      "resolution": "1280x720",
+      "fps": 30,
+      "supported_resolutions": ["1920x1080"],
+      "supported_framerates": [30],
+      "supported_codec": ["h264"]
+    }
+  ]
+}
+```
+
+`400 Bad Request`:
+
+```json
+{
+  "type": "about:blank",
+  "title": "Bad Request",
+  "status": 400,
+  "detail": "cameras[0].resolution must be one of the supported_resolutions",
+  "instance": "/ws/register"
+}
+```
+
+The same rule applies to `fps` and `supported_framerates`, answering
+`cameras[0].fps must be one of the supported_framerates` when the announced frame rate is missing
+from the list.
 
 ### Missing or malformed token
 

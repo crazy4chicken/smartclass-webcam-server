@@ -120,12 +120,12 @@ in the command's `ack`:
 curl -sS -X POST "$WEBCAM_URL/api/devices/<device-id>/recording/start" \
   -H "Authorization: Bearer $WEBCAM_TOKEN" \
   -H 'Content-Type: application/json' \
-  --data '{"camera_enum":0}'
+  --data '{"camera_enum":0,"codec":"h264"}'
 
 curl -sS -X POST "$WEBCAM_URL/api/devices/<device-id>/camera/switch" \
   -H "Authorization: Bearer $WEBCAM_TOKEN" \
   -H 'Content-Type: application/json' \
-  --data '{"camera_enum":1}'
+  --data '{"camera_enum":1,"resolution":"1280x720","fps":15}'
 
 curl -sS -X POST "$WEBCAM_URL/api/devices/<device-id>/photo" \
   -H "Authorization: Bearer $WEBCAM_TOKEN" \
@@ -141,12 +141,22 @@ curl -sS -X POST "$WEBCAM_URL/api/devices/<device-id>/recording/stop" \
 `recording/start` creates an `active` stream session, snapshots the camera's
 parameters into the session metadata, and sends `start_recording` to the device;
 `recording/stop` sends `stop_recording` and finalizes the session as
-`completed`. `GET /api/devices/{device_id}/streams` lists the sessions, and
+`completed`. The optional `codec` of `recording/start` is recorded in the
+stream's `metadata.codec` (omitted when the request named none, in which case
+the device records with its preferred codec — the first entry of the camera's
+`supported_codec` list), while `metadata.codecs` carries the camera's whole
+list. `GET /api/devices/{device_id}/streams` lists the sessions, and
 `GET /api/streams/{stream_id}/` returns one together with its segments — each
 segment in that response carries a presigned `download_url` valid for 15
 minutes. `GET /api/streams/{stream_id}/segments` lists the same segments
 **without** download URLs. The [Service Integration](/guide/service-integration)
 guide walks through retrieving recordings and photos.
+
+A device captures from exactly one camera at exactly one resolution and frame
+rate at a time and never changes them on its own: only `camera/switch` moves it,
+and the optional `resolution` and `fps` it names must be values the device
+declared at registration (otherwise the call answers `400`). Photos are always
+JPEG, so every stored photo record reports `"content_type": "image/jpeg"`.
 
 Every `/api` route requires a Bearer token carrying `cam:read`, `cam:manage`,
 or `cam:control` at the right scope (see
