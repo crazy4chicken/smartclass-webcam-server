@@ -3,8 +3,10 @@ package config
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -78,4 +80,33 @@ func envOrDefault(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// Secrets returns the credential material this configuration carries, so text
+// taken from errors or dependencies can be scrubbed before it leaves the
+// service.
+func (c *Config) Secrets() []string {
+	return []string{
+		c.S3AccessKey,
+		c.S3SecretKey,
+		c.TeamusersSvcToken,
+		c.TeamusersSecret,
+		dbPassword(c.DBURL),
+	}
+}
+
+// dbPassword extracts the password of a PostgreSQL URL or keyword/value
+// connection string.
+func dbPassword(dbURL string) string {
+	if parsed, err := url.Parse(dbURL); err == nil && parsed.User != nil {
+		if password, ok := parsed.User.Password(); ok {
+			return password
+		}
+	}
+	for _, field := range strings.Fields(dbURL) {
+		if value, ok := strings.CutPrefix(field, "password="); ok {
+			return strings.Trim(value, `'"`)
+		}
+	}
+	return ""
 }

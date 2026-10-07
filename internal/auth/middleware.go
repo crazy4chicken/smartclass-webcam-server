@@ -2,10 +2,10 @@
 // the webcam server, backed by the teamusers IAM service.
 //
 // Middleware only needs the JWKS verifier and works without any credentials of
-// our own. Require additionally asks teamusers for the caller's effective
-// permissions, so a service token must be supplied with iam.WithServiceToken or
-// iam.WithTokenSource for authorization to succeed; without one Require fails
-// closed and rejects every request.
+// our own. RequireCollection and RequireDevice additionally ask teamusers for
+// the caller's effective permissions, so a service token must be supplied with
+// iam.WithServiceToken or iam.WithTokenSource for authorization to succeed;
+// without one they fail closed and reject every request.
 package auth
 
 import (
@@ -17,6 +17,8 @@ import (
 	"strings"
 
 	iam "github.com/crazy4chicken/nsc-teamusers/sdk/go"
+
+	"github.com/crazy4chicken/smartclass-webcam-server/internal/redact"
 )
 
 // Auth couples a teamusers JWKS verifier with the SDK middleware client that
@@ -24,6 +26,12 @@ import (
 type Auth struct {
 	client   *iam.Client
 	verifier *iam.Verifier
+	// audience is the expected token audience, named when a token carries a
+	// different one.
+	audience string
+	// sanitize strips configured secrets from error text before it reaches a
+	// response body. It may be nil.
+	sanitize func(string) string
 }
 
 // New builds an Auth for the teamusers service at teamusersURL. audience is the
@@ -31,9 +39,10 @@ type Auth struct {
 //
 // opts are applied to both the verifier and the permission client; each SDK
 // option targets the component it belongs to. Supply an authorization
-// credential (iam.WithServiceToken or iam.WithTokenSource) to make Require
-// evaluate permissions.
-func New(teamusersURL, audience string, opts ...iam.Option) (*Auth, error) {
+// credential (iam.WithServiceToken or iam.WithTokenSource) to make the
+// authorization gates evaluate permissions. sanitize, which may be nil, is
+// applied to every error cause the middleware copies into a response body.
+func New(teamusersURL, audience string, sanitize func(string) string, opts ...iam.Option) (*Auth, error) {
 	base, err := parseBaseURL(teamusersURL)
 	if err != nil {
 		return nil, err
@@ -45,6 +54,8 @@ func New(teamusersURL, audience string, opts ...iam.Option) (*Auth, error) {
 	return &Auth{
 		client:   iam.NewClient(verifier, permissions),
 		verifier: verifier,
+		audience: strings.TrimSpace(audience),
+		sanitize: sanitize,
 	}, nil
 }
 
@@ -71,7 +82,10 @@ func (a *Auth) Close() error {
 
 // Middleware returns middleware that verifies a Bearer token and stores the
 // resulting claims in the request context, where downstream handlers read them
-// with ClaimsFromContext.
+// with ClaimsFromContext. A token that fails verification answers 401 with the
+// cause the JWKS verifier reported, so the caller learns whether the token is
+// expired, was issued for another audience, is signed by an unknown key, and so
+// on.
 //
 // Requests without an Authorization header pass through unauthenticated, so the
 // middleware can be mounted above public routes. Routes that require a caller
@@ -90,30 +104,111 @@ func (a *Auth) Middleware() func(http.Handler) http.Handler {
 			})
 		}
 	}
-	verify := a.client.Middleware
 	return func(next http.Handler) http.Handler {
-		authenticated := verify(next)
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if next != nil && strings.TrimSpace(r.Header.Get("Authorization")) == "" {
+			header := r.Header.Get("Authorization")
+			if strings.TrimSpace(header) == "" {
 				next.ServeHTTP(w, r)
 				return
 			}
-			authenticated.ServeHTTP(w, r)
+			token, reason := bearerToken(header)
+			if reason != "" {
+				writeUnauthorized(w, "invalid_request", reason)
+				return
+			}
+			claims, err := a.verifier.Verify(r.Context(), token)
+			if err != nil {
+				writeUnauthorized(w, "invalid_token", a.tokenFailureReason(err))
+				return
+			}
+			next.ServeHTTP(w, r.WithContext(iam.WithClaims(r.Context(), claims)))
 		})
 	}
 }
 
-// Require returns middleware that authorizes permission against the resource
-// derived from each request. Requests without verified claims are rejected with
-// 401 and denied authorizations with 403.
-func (a *Auth) Require(permission string, resourceFn func(*http.Request) iam.Resource) func(http.Handler) http.Handler {
-	if a.isDev() {
-		// Dev mode: allow every request.
-		return func(next http.Handler) http.Handler {
-			return next
-		}
+// expectedIssuer is the token issuer the verifier accepts; the SDK default is
+// not overridden anywhere in this service.
+const expectedIssuer = "teamusers"
+
+// expectedAudience returns the audience the verifier accepts, falling back to
+// the SDK default.
+func (a *Auth) expectedAudience() string {
+	if a.audience != "" {
+		return a.audience
 	}
-	return a.client.Require(permission, resourceFn)
+	return expectedIssuer
+}
+
+// bearerToken extracts the access token from an Authorization header value and
+// reports why the header cannot be used.
+func bearerToken(header string) (string, string) {
+	scheme, rest, found := strings.Cut(strings.TrimLeft(header, " \t"), " ")
+	if !found {
+		return "", `the authorization header must read "Bearer <access token>"`
+	}
+	if !strings.EqualFold(scheme, "Bearer") {
+		return "", fmt.Sprintf("the authorization header uses the %s scheme; only Bearer is accepted", strings.ToLower(scheme))
+	}
+	token := strings.TrimSpace(rest)
+	switch {
+	case token == "":
+		return "", "the authorization header carries an empty bearer token"
+	case strings.ContainsAny(token, " \t"):
+		return "", "the authorization header carries more than the bearer token"
+	}
+	return token, ""
+}
+
+// tokenFailureReason explains a failed access-token verification in terms the
+// caller can act on. The cases below name the ones the verifier reports and
+// everything else is passed through as reported, so an unrecognised cause still
+// reaches the caller instead of collapsing into a bare "authentication failed".
+func (a *Auth) tokenFailureReason(err error) string {
+	text := redact.Trim(redact.Text(a.sanitize, err.Error()), 240)
+	switch {
+	case strings.Contains(text, `"exp" not satisfied`):
+		return "access token is expired"
+	case strings.Contains(text, `"nbf" not satisfied`):
+		return "access token is not valid yet (nbf claim)"
+	case strings.Contains(text, `"iss" not satisfied`):
+		return fmt.Sprintf("access token issuer is not %q", expectedIssuer)
+	case text == "invalid access token audience":
+		return fmt.Sprintf("access token audience is not %q", a.expectedAudience())
+	case text == "invalid access token kind":
+		return `access token kind must be "user" or "service"`
+	case text == "invalid access token perm_ver":
+		return "access token perm_ver claim must be a non-negative integer"
+	case strings.Contains(text, "could not verify message using any of the signatures or keys"):
+		return "access token signature matches no key in the issuer's JWKS document"
+	case strings.Contains(text, "failed to find key with key ID"):
+		if kid := unknownKeyID(text); kid != "" {
+			return fmt.Sprintf("access token names a signing key the issuer does not publish (kid %q)", kid)
+		}
+		return "access token names a signing key the issuer does not publish"
+	case strings.Contains(text, "failed to parse jws"), strings.Contains(text, "failed to parse JOSE"):
+		return "access token is not a valid JWS: " + text
+	case strings.Contains(text, "fetch JWKS"),
+		strings.Contains(text, "refresh JWKS"),
+		strings.Contains(text, "JWKS cache is unavailable"),
+		strings.Contains(text, "configure JWKS cache"):
+		return "the issuer's JWKS document is unavailable: " + text
+	}
+	return text
+}
+
+// unknownKeyID returns the kid named by the verifier's unknown-key error.
+func unknownKeyID(text string) string {
+	const marker = `key ID "`
+	start := strings.Index(text, marker)
+	if start < 0 {
+		return ""
+	}
+	rest := text[start+len(marker):]
+	end := strings.Index(rest, `"`)
+	if end < 0 {
+		return ""
+	}
+	return rest[:end]
 }
 
 // ClaimsFromContext returns the verified claims stored by Middleware, or nil

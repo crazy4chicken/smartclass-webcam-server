@@ -63,7 +63,7 @@ func (s *Server) handleDeviceStreams(w http.ResponseWriter, r *http.Request) {
 	}
 	streams, err := s.store.Streams.ListByDevice(r.Context(), chi.URLParam(r, "device_id"), limit)
 	if err != nil {
-		writeStoreError(w, r, err, "device not found")
+		s.writeStoreError(w, r, "list device streams", err, "device not found", "")
 		return
 	}
 	writeJSON(w, http.StatusOK, newListResponse(streams))
@@ -77,7 +77,7 @@ func (s *Server) handleDevicePhotos(w http.ResponseWriter, r *http.Request) {
 	}
 	photos, err := s.store.Photos.ListByDevice(r.Context(), chi.URLParam(r, "device_id"), limit)
 	if err != nil {
-		writeStoreError(w, r, err, "device not found")
+		s.writeStoreError(w, r, "list device photos", err, "device not found", "")
 		return
 	}
 	writeJSON(w, http.StatusOK, newListResponse(photos))
@@ -89,7 +89,7 @@ func (s *Server) handleStreamGet(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "stream_id")
 	stream, err := s.store.Streams.Get(r.Context(), id)
 	if err != nil {
-		writeStoreError(w, r, err, fmt.Sprintf("stream %q not found", id))
+		s.writeStoreError(w, r, "load stream", err, fmt.Sprintf("stream %q not found", id), "")
 		return
 	}
 	limit, ok := parseLimit(w, r)
@@ -99,7 +99,7 @@ func (s *Server) handleStreamGet(w http.ResponseWriter, r *http.Request) {
 
 	segments, err := s.store.Segments.ListByStream(r.Context(), stream.ID, limit)
 	if err != nil {
-		writeStoreError(w, r, err, "stream not found")
+		s.writeStoreError(w, r, "list stream segments", err, "stream not found", "")
 		return
 	}
 
@@ -127,7 +127,7 @@ func (s *Server) handleStreamSegments(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "stream_id")
 	stream, err := s.store.Streams.Get(r.Context(), id)
 	if err != nil {
-		writeStoreError(w, r, err, fmt.Sprintf("stream %q not found", id))
+		s.writeStoreError(w, r, "load stream", err, fmt.Sprintf("stream %q not found", id), "")
 		return
 	}
 	limit, ok := parseLimit(w, r)
@@ -137,7 +137,7 @@ func (s *Server) handleStreamSegments(w http.ResponseWriter, r *http.Request) {
 
 	segments, err := s.store.Segments.ListByStream(r.Context(), stream.ID, limit)
 	if err != nil {
-		writeStoreError(w, r, err, "stream not found")
+		s.writeStoreError(w, r, "list stream segments", err, "stream not found", "")
 		return
 	}
 	writeJSON(w, http.StatusOK, newListResponse(segments))
@@ -149,7 +149,7 @@ func (s *Server) handlePhotoGet(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "photo_id")
 	photo, err := s.store.Photos.Get(r.Context(), id)
 	if err != nil {
-		writeStoreError(w, r, err, fmt.Sprintf("photo %q not found", id))
+		s.writeStoreError(w, r, "load photo", err, fmt.Sprintf("photo %q not found", id), "")
 		return
 	}
 

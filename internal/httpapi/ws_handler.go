@@ -54,13 +54,13 @@ type deviceRegisterResponse struct {
 // WebSocket ticket.
 func (s *Server) handleDeviceRegister(w http.ResponseWriter, r *http.Request) {
 	var req deviceRegisterRequest
-	if !decodeJSON(w, r, &req) {
+	if !s.decodeJSON(w, r, &req) {
 		return
 	}
 
 	token, ok := auth.DeviceTokenFromRequest(r)
 	if !ok {
-		writeDeviceAuthFailure(w, r)
+		writeDeviceAuthFailure(w, r, deviceHeaderReason(r))
 		return
 	}
 
@@ -68,18 +68,17 @@ func (s *Server) handleDeviceRegister(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case err == nil:
 	case errors.Is(err, store.ErrNotFound):
-		writeDeviceAuthFailure(w, r)
+		writeDeviceAuthFailure(w, r, deviceTokenRejected)
 		return
 	default:
-		slog.Error("load device for registration", "device_id", req.DeviceID, "error", err)
-		writeProblem(w, r, http.StatusInternalServerError, "internal server error")
+		s.fail(w, r, "load device for registration", err)
 		return
 	}
 
 	// Compare hashes so neither an unknown device nor a wrong token leaks
 	// whether the device exists.
 	if subtle.ConstantTimeCompare(device.TokenHash, auth.HashDeviceToken(token)) != 1 {
-		writeDeviceAuthFailure(w, r)
+		writeDeviceAuthFailure(w, r, deviceTokenRejected)
 		return
 	}
 
@@ -90,8 +89,7 @@ func (s *Server) handleDeviceRegister(w http.ResponseWriter, r *http.Request) {
 
 	reg, err := s.registry.Create(device.ID, req.Cameras)
 	if err != nil {
-		slog.Error("issue device websocket ticket", "device_id", device.ID, "error", err)
-		writeProblem(w, r, http.StatusInternalServerError, "internal server error")
+		s.fail(w, r, "issue device websocket ticket", err)
 		return
 	}
 
@@ -200,9 +198,32 @@ func validateCameraCapabilities(cameras []ws.CameraCapability) error {
 	return nil
 }
 
-// writeDeviceAuthFailure writes the single 401 response shared by every device
-// token failure, so an unknown device and a bad token are indistinguishable.
-func writeDeviceAuthFailure(w http.ResponseWriter, r *http.Request) {
+// deviceTokenRejected is the one reason a well-formed device credential is
+// rejected, shared by an unknown device id and a wrong or rotated token so the
+// endpoint never leaks whether a device exists.
+const deviceTokenRejected = "the device token is unknown or has been rotated"
+
+// deviceHeaderReason names why the Authorization header carried no device
+// token, mirroring the parse auth.DeviceTokenFromRequest applies; the wdt_
+// prefix is the auth package's deviceTokenPrefix. The header value itself is
+// never repeated.
+func deviceHeaderReason(r *http.Request) string {
+	fields := strings.Fields(r.Header.Get("Authorization"))
+	switch {
+	case len(fields) == 0:
+		return "the Authorization header is missing"
+	case len(fields) != 2 || !strings.EqualFold(fields[0], "bearer"):
+		return "the Authorization header does not carry a Bearer token"
+	case !strings.HasPrefix(fields[1], "wdt_"):
+		return "the Authorization header does not carry a device token"
+	default:
+		return deviceTokenRejected
+	}
+}
+
+// writeDeviceAuthFailure writes the 401 response for a device credential the
+// request did not present in a usable shape.
+func writeDeviceAuthFailure(w http.ResponseWriter, r *http.Request, reason string) {
 	w.Header().Set("WWW-Authenticate", `Bearer realm="device"`)
-	writeProblem(w, r, http.StatusUnauthorized, "device authentication failed")
+	writeProblem(w, r, http.StatusUnauthorized, reason)
 }

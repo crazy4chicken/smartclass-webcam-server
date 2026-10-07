@@ -39,9 +39,9 @@
 //
 // Collection endpoints return {"items": [...]}. Single-resource endpoints
 // return the resource object itself. Errors use RFC 9457 problem details
-// (application/problem+json) with type "about:blank"; the missing-claims 401
-// emitted by the teamusers middleware uses the SDK's own
-// {"allow": false, "reason": ...} shape instead.
+// (application/problem+json) with type "about:blank"; a 401 on an /api route is
+// instead the teamusers SDK decision body {"allow": false, "reason": ...}, whose
+// reason names the exact cause.
 //
 // DocOperations lists every route together with its request and response
 // shapes. cmd/genspec walks the router and reflects the table into
@@ -221,22 +221,94 @@ func docForbidden(action string) apidocs.ErrorDoc {
 	return docError(403, "permission denied: cam:"+action+":any (no matching grant)", "Forbidden")
 }
 
+// docFailure builds the 500 problem an operation documents. Every server-side
+// failure names the operation that failed and the sanitized cause behind it, so
+// the example documents the prefix and leaves the cause open.
+func docFailure(operation string) apidocs.ErrorDoc {
+	return docError(500, operation+" failed: <cause>", "Internal Server Error")
+}
+
+// docCommandFailure builds the 502 problem a command route documents: the
+// command it could not deliver and the classified websocket cause behind it.
+func docCommandFailure(command string) apidocs.ErrorDoc {
+	return docError(502, "sending "+command+" failed: <cause>", "Bad Gateway")
+}
+
+// docLoadFailure builds the 500 problem RequireDevice writes when it cannot
+// load the resource whose access it authorizes.
+func docLoadFailure(target string) apidocs.ErrorDoc {
+	return docFailure("loading the " + target)
+}
+
 var (
-	docInvalidBody       = docError(400, "invalid JSON request body", "Invalid Request")
-	docBodyTooLarge      = docError(413, "request body too large", "Request Entity Too Large")
-	docBadLimit          = docError(400, "limit must be a positive integer", "Invalid Request")
-	docUnauthorized      = docError(401, "authentication failed", "Unauthorized")
-	docDeviceAuthFailed  = docError(401, "device authentication failed", "Unauthorized")
-	docDeviceNotFound    = docError(404, "device not found", "Not Found")
-	docStreamNotFound    = docError(404, "stream not found", "Not Found")
-	docPhotoNotFound     = docError(404, "photo not found", "Not Found")
-	docTicketNotFound    = docError(404, "device websocket ticket not found", "Not Found")
-	docTicketReplay      = docError(409, "device websocket ticket is already attached to a live session", "Conflict")
-	docDeviceOffline     = docError(409, "device is offline", "Conflict")
-	docStreamActive      = docError(409, "a stream is already active for this camera", "Conflict")
-	docCommandFailed     = docError(502, "device connection is unavailable", "Bad Gateway")
-	docInternalFailure   = docError(500, "internal server error", "Internal Server Error")
-	docCameraEnumUnknown = docError(400, "camera_enum is not part of the device registration", "Invalid Request")
+	docInvalidBody   = docError(400, "invalid JSON request body: <cause>", "Invalid Request")
+	docBodyNotSingle = docError(400, "request body must contain a single JSON object", "Invalid Request")
+	docBodyTooLarge  = docError(413, "request body too large", "Request Entity Too Large")
+	docBadLimit      = docError(400, "limit must be a positive integer", "Invalid Request")
+)
+
+// The 401 of an /api route is the teamusers decision body
+// {"allow": false, "reason": "..."}, not a problem document: reason names the
+// exact cause, one of "the authorization header is missing; send
+// \"Authorization: Bearer <access token>\"", "the authorization header must
+// read \"Bearer <access token>\"", "access token is expired", "access token
+// audience is not \"webcam\"", "access token issuer is not \"teamusers\"",
+// "access token signature matches no key in the issuer's JWKS document",
+// "access token names a signing key the issuer does not publish (kid \"...\")",
+// "access token is not a valid JWS: ..." and "the issuer's JWKS document is
+// unavailable: ...". The example below names the most common cause.
+var docUnauthorized = docError(401, "access token is expired", "Unauthorized")
+
+// The device plane answers 401 with the reason the credential was rejected. An
+// unknown device, a wrong token and a rotated token share the last reason, so
+// the endpoint never leaks whether a device exists.
+var (
+	docDeviceAuthMissing  = docError(401, "the Authorization header is missing", "Unauthorized")
+	docDeviceAuthScheme   = docError(401, "the Authorization header does not carry a Bearer token", "Unauthorized")
+	docDeviceAuthToken    = docError(401, "the Authorization header does not carry a device token", "Unauthorized")
+	docDeviceAuthRejected = docError(401, "the device token is unknown or has been rotated", "Unauthorized")
+)
+
+var (
+	docDeviceNotFound = docError(404, "device not found", "Not Found")
+	docStreamNotFound = docError(404, "stream not found", "Not Found")
+	docPhotoNotFound  = docError(404, "photo not found", "Not Found")
+	docTicketNotFound = docError(404, "device websocket not found", "Not Found")
+)
+
+// The read handlers repeat the middleware's 404 with the id from the path, so a
+// resource deleted between authorization and the read still names itself.
+var (
+	docStreamNotFoundByID = docError(404, `stream "<stream_id>" not found`, "Not Found")
+	docPhotoNotFoundByID  = docError(404, `photo "<photo_id>" not found`, "Not Found")
+	docNoActiveStream     = docError(404, `no active stream for camera_enum <camera_enum> on device "<device_id>"`, "Not Found")
+)
+
+var (
+	docTicketReplay = docError(409, "device websocket ticket already attached", "Conflict")
+	docDeviceExists = docError(409, "a device with this id already exists", "Conflict")
+	docStreamActive = docError(409, `camera_enum <camera_enum> is already streaming on device "<device_id>"`, "Conflict")
+)
+
+// The two offline checks behind the command routes: the device never
+// registered, or it registered but its websocket is not attached.
+var (
+	docDeviceOfflineNoRegistration = docError(409, `device "<device_id>" is offline: no live registration`, "Conflict")
+	docDeviceOfflineNoWebsocket    = docError(409, `device "<device_id>" is offline: no live websocket`, "Conflict")
+)
+
+// docPanic documents the response the recoverer writes for a handler panic.
+var docPanic = docError(500, "panic: <cause>", "Internal Server Error")
+
+var (
+	docCameraEnumUnknown  = docError(400, `camera_enum <camera_enum> is not registered for device "<device_id>"`, "Invalid Request")
+	docCamerasEmpty       = docError(400, "cameras must not be empty", "Invalid Request")
+	docCameraEnumOrder    = docError(400, `cameras[<index>].camera_enum must be <index>`, "Invalid Request")
+	docCameraResolution   = docError(400, `cameras[<index>].resolution must not be empty`, "Invalid Request")
+	docCameraFPS          = docError(400, `cameras[<index>].fps must be positive`, "Invalid Request")
+	docCameraCodecEmpty   = docError(400, `cameras[<index>].supported_codec must not be empty`, "Invalid Request")
+	docCameraCodecRepeat  = docError(400, `cameras[<index>].supported_codec must not contain duplicates`, "Invalid Request")
+	docCameraCodecUnknown = docError(400, `cameras[<index>].supported_codec[<codec>] must be one of `+strings.Join(ws.SupportedCodecNames(), ", "), "Invalid Request")
 )
 
 var (
@@ -444,11 +516,21 @@ var DocOperations = []apidocs.Operation{
 		ResponseExample: registerResponseExample,
 		Errors: []apidocs.ErrorDoc{
 			docInvalidBody,
-			docError(400, "cameras must not be empty", "Invalid Request"),
-			docError(400, "camera_enum values must be 0..n-1 in order without gaps or duplicates", "Invalid Request"),
+			docBodyNotSingle,
 			docBodyTooLarge,
-			docDeviceAuthFailed,
-			docInternalFailure,
+			docCamerasEmpty,
+			docCameraEnumOrder,
+			docCameraResolution,
+			docCameraFPS,
+			docCameraCodecEmpty,
+			docCameraCodecUnknown,
+			docCameraCodecRepeat,
+			docDeviceAuthMissing,
+			docDeviceAuthScheme,
+			docDeviceAuthToken,
+			docDeviceAuthRejected,
+			docFailure("load device for registration"),
+			docFailure("issue device websocket ticket"),
 		},
 	},
 	{
@@ -460,7 +542,7 @@ var DocOperations = []apidocs.Operation{
 		Errors: []apidocs.ErrorDoc{
 			docTicketNotFound,
 			docTicketReplay,
-			docInternalFailure,
+			docPanic,
 		},
 	},
 
@@ -473,7 +555,7 @@ var DocOperations = []apidocs.Operation{
 		Security:        "bearerAuth",
 		Response:        listResponse[domain.Device]{},
 		ResponseExample: map[string]any{"items": []any{deviceExample}},
-		Errors:          []apidocs.ErrorDoc{docBadLimit, docUnauthorized, docForbidden("read"), docInternalFailure},
+		Errors:          []apidocs.ErrorDoc{docBadLimit, docUnauthorized, docForbidden("read"), docFailure("list devices")},
 	},
 	{
 		Method:      "POST",
@@ -491,12 +573,13 @@ var DocOperations = []apidocs.Operation{
 		ResponseExample: deviceTokenExample,
 		Errors: []apidocs.ErrorDoc{
 			docInvalidBody,
-			docError(400, "name is required", "Invalid Request"),
-			docError(400, "team_id and owner_id cannot be set outside your scope", "Invalid Request"),
+			docBodyNotSingle,
 			docBodyTooLarge,
+			docError(400, "name is required", "Invalid Request"),
 			docUnauthorized,
 			docForbidden("manage"),
-			docInternalFailure,
+			docDeviceExists,
+			docFailure("create device"),
 		},
 	},
 	{
@@ -508,7 +591,7 @@ var DocOperations = []apidocs.Operation{
 		Security:        "bearerAuth",
 		Response:        docDeviceDetail{},
 		ResponseExample: deviceDetailExample,
-		Errors:          []apidocs.ErrorDoc{docUnauthorized, docForbidden("read"), docDeviceNotFound, docInternalFailure},
+		Errors:          []apidocs.ErrorDoc{docUnauthorized, docForbidden("read"), docDeviceNotFound, docLoadFailure("device")},
 	},
 	{
 		Method:      "PUT",
@@ -526,13 +609,15 @@ var DocOperations = []apidocs.Operation{
 		ResponseExample: updatedDeviceExample,
 		Errors: []apidocs.ErrorDoc{
 			docInvalidBody,
+			docBodyNotSingle,
+			docBodyTooLarge,
 			docError(400, "request body must contain at least one of name, location, team_id or owner_id", "Invalid Request"),
 			docError(400, "name must not be empty", "Invalid Request"),
-			docBodyTooLarge,
 			docUnauthorized,
 			docForbidden("manage"),
 			docDeviceNotFound,
-			docInternalFailure,
+			docLoadFailure("device"),
+			docFailure("update device"),
 		},
 	},
 	{
@@ -542,7 +627,7 @@ var DocOperations = []apidocs.Operation{
 		Summary:     "Delete a device",
 		Description: "Use to remove a device together with every stream, segment and photo recorded for it. A live connection is closed and any pending ticket is invalidated. The response has no body; deleting an unknown device answers 404 and changes nothing.",
 		Security:    "bearerAuth",
-		Errors:      []apidocs.ErrorDoc{docUnauthorized, docForbidden("manage"), docDeviceNotFound, docInternalFailure},
+		Errors:      []apidocs.ErrorDoc{docUnauthorized, docForbidden("manage"), docDeviceNotFound, docLoadFailure("device"), docFailure("delete device")},
 	},
 	{
 		Method:          "POST",
@@ -553,7 +638,7 @@ var DocOperations = []apidocs.Operation{
 		Security:        "bearerAuth",
 		Response:        docDeviceToken{},
 		ResponseExample: deviceTokenExample,
-		Errors:          []apidocs.ErrorDoc{docUnauthorized, docForbidden("manage"), docDeviceNotFound, docInternalFailure},
+		Errors:          []apidocs.ErrorDoc{docUnauthorized, docForbidden("manage"), docDeviceNotFound, docLoadFailure("device"), docFailure("rotate device token")},
 	},
 
 	{
@@ -569,15 +654,17 @@ var DocOperations = []apidocs.Operation{
 		ResponseExample: switchAcceptedExample,
 		Errors: []apidocs.ErrorDoc{
 			docInvalidBody,
+			docBodyNotSingle,
+			docBodyTooLarge,
 			docError(400, "camera_enum is required", "Invalid Request"),
 			docCameraEnumUnknown,
-			docBodyTooLarge,
 			docUnauthorized,
 			docForbidden("control"),
 			docDeviceNotFound,
-			docDeviceOffline,
-			docCommandFailed,
-			docInternalFailure,
+			docDeviceOfflineNoRegistration,
+			docDeviceOfflineNoWebsocket,
+			docCommandFailure(ws.CommandSwitchCamera),
+			docLoadFailure("device"),
 		},
 	},
 	{
@@ -593,16 +680,19 @@ var DocOperations = []apidocs.Operation{
 		ResponseExample: streamExample,
 		Errors: []apidocs.ErrorDoc{
 			docInvalidBody,
+			docBodyNotSingle,
+			docBodyTooLarge,
 			docError(400, "camera_enum is required", "Invalid Request"),
 			docCameraEnumUnknown,
-			docBodyTooLarge,
 			docUnauthorized,
 			docForbidden("control"),
 			docDeviceNotFound,
-			docDeviceOffline,
+			docDeviceOfflineNoRegistration,
+			docDeviceOfflineNoWebsocket,
 			docStreamActive,
-			docCommandFailed,
-			docInternalFailure,
+			docCommandFailure(ws.CommandStartRecording),
+			docLoadFailure("device"),
+			docFailure("create stream"),
 		},
 	},
 	{
@@ -618,15 +708,19 @@ var DocOperations = []apidocs.Operation{
 		ResponseExample: completedStreamExample,
 		Errors: []apidocs.ErrorDoc{
 			docInvalidBody,
-			docError(400, "camera_enum is required", "Invalid Request"),
+			docBodyNotSingle,
 			docBodyTooLarge,
+			docError(400, "camera_enum is required", "Invalid Request"),
 			docUnauthorized,
 			docForbidden("control"),
 			docDeviceNotFound,
-			docStreamNotFound,
-			docDeviceOffline,
-			docCommandFailed,
-			docInternalFailure,
+			docNoActiveStream,
+			docStreamNotFoundByID,
+			docDeviceOfflineNoWebsocket,
+			docCommandFailure(ws.CommandStopRecording),
+			docLoadFailure("device"),
+			docFailure("find active stream"),
+			docFailure("finish stream"),
 		},
 	},
 	{
@@ -642,15 +736,17 @@ var DocOperations = []apidocs.Operation{
 		ResponseExample: photoAcceptedExample,
 		Errors: []apidocs.ErrorDoc{
 			docInvalidBody,
+			docBodyNotSingle,
+			docBodyTooLarge,
 			docError(400, "camera_enum is required", "Invalid Request"),
 			docCameraEnumUnknown,
-			docBodyTooLarge,
 			docUnauthorized,
 			docForbidden("control"),
 			docDeviceNotFound,
-			docDeviceOffline,
-			docCommandFailed,
-			docInternalFailure,
+			docDeviceOfflineNoRegistration,
+			docDeviceOfflineNoWebsocket,
+			docCommandFailure(ws.CommandTakePhoto),
+			docLoadFailure("device"),
 		},
 	},
 
@@ -663,7 +759,7 @@ var DocOperations = []apidocs.Operation{
 		Security:        "bearerAuth",
 		Response:        listResponse[domain.Stream]{},
 		ResponseExample: map[string]any{"items": []any{streamExample, completedStreamExample}},
-		Errors:          []apidocs.ErrorDoc{docBadLimit, docUnauthorized, docForbidden("read"), docDeviceNotFound, docInternalFailure},
+		Errors:          []apidocs.ErrorDoc{docBadLimit, docUnauthorized, docForbidden("read"), docDeviceNotFound, docLoadFailure("device"), docFailure("list device streams")},
 	},
 	{
 		Method:          "GET",
@@ -674,7 +770,7 @@ var DocOperations = []apidocs.Operation{
 		Security:        "bearerAuth",
 		Response:        listResponse[domain.Photo]{},
 		ResponseExample: map[string]any{"items": []any{photoExample}},
-		Errors:          []apidocs.ErrorDoc{docBadLimit, docUnauthorized, docForbidden("read"), docDeviceNotFound, docInternalFailure},
+		Errors:          []apidocs.ErrorDoc{docBadLimit, docUnauthorized, docForbidden("read"), docDeviceNotFound, docLoadFailure("device"), docFailure("list device photos")},
 	},
 	{
 		Method:          "GET",
@@ -685,7 +781,7 @@ var DocOperations = []apidocs.Operation{
 		Security:        "bearerAuth",
 		Response:        docStreamDetail{},
 		ResponseExample: streamDetailExample,
-		Errors:          []apidocs.ErrorDoc{docBadLimit, docUnauthorized, docForbidden("read"), docStreamNotFound, docInternalFailure},
+		Errors:          []apidocs.ErrorDoc{docBadLimit, docUnauthorized, docForbidden("read"), docStreamNotFound, docStreamNotFoundByID, docLoadFailure("stream"), docFailure("load stream"), docFailure("list stream segments")},
 	},
 	{
 		Method:          "GET",
@@ -696,7 +792,7 @@ var DocOperations = []apidocs.Operation{
 		Security:        "bearerAuth",
 		Response:        listResponse[domain.StreamSegment]{},
 		ResponseExample: map[string]any{"items": []any{segmentExample}},
-		Errors:          []apidocs.ErrorDoc{docBadLimit, docUnauthorized, docForbidden("read"), docStreamNotFound, docInternalFailure},
+		Errors:          []apidocs.ErrorDoc{docBadLimit, docUnauthorized, docForbidden("read"), docStreamNotFound, docStreamNotFoundByID, docLoadFailure("stream"), docFailure("load stream"), docFailure("list stream segments")},
 	},
 	{
 		Method:          "GET",
@@ -707,6 +803,6 @@ var DocOperations = []apidocs.Operation{
 		Security:        "bearerAuth",
 		Response:        docPhotoDetail{},
 		ResponseExample: photoDetailExample,
-		Errors:          []apidocs.ErrorDoc{docUnauthorized, docForbidden("read"), docPhotoNotFound, docInternalFailure},
+		Errors:          []apidocs.ErrorDoc{docUnauthorized, docForbidden("read"), docPhotoNotFound, docPhotoNotFoundByID, docLoadFailure("photo"), docFailure("load photo")},
 	},
 }

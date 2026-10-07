@@ -10,6 +10,7 @@ import (
 	"github.com/oklog/ulid/v2"
 
 	"github.com/crazy4chicken/smartclass-webcam-server/internal/domain"
+	"github.com/crazy4chicken/smartclass-webcam-server/internal/redact"
 	"github.com/crazy4chicken/smartclass-webcam-server/internal/store"
 	"github.com/crazy4chicken/smartclass-webcam-server/internal/ws"
 )
@@ -33,9 +34,9 @@ type photoCommandResponse struct {
 }
 
 // decodeCameraEnum decodes the command body and returns the requested camera.
-func decodeCameraEnum(w http.ResponseWriter, r *http.Request) (int, bool) {
+func (s *Server) decodeCameraEnum(w http.ResponseWriter, r *http.Request) (int, bool) {
 	var req cameraCommandRequest
-	if !decodeJSON(w, r, &req) {
+	if !s.decodeJSON(w, r, &req) {
 		return 0, false
 	}
 	if req.CameraEnum == nil {
@@ -46,15 +47,16 @@ func decodeCameraEnum(w http.ResponseWriter, r *http.Request) (int, bool) {
 }
 
 // requireLiveDevice returns the device's live registration, writing a 409
-// problem response when the device has no live session.
+// problem response naming which check failed when the device has no live
+// session.
 func (s *Server) requireLiveDevice(w http.ResponseWriter, r *http.Request, deviceID string) (*ws.Registration, bool) {
 	registration, ok := s.registry.Current(deviceID)
 	if !ok {
-		writeProblem(w, r, http.StatusConflict, fmt.Sprintf("device %q is offline", deviceID))
+		writeProblem(w, r, http.StatusConflict, fmt.Sprintf("device %q is offline: no live registration", deviceID))
 		return nil, false
 	}
 	if _, ok := s.hub.Client(deviceID); !ok {
-		writeProblem(w, r, http.StatusConflict, fmt.Sprintf("device %q is offline", deviceID))
+		writeProblem(w, r, http.StatusConflict, fmt.Sprintf("device %q is offline: no live websocket", deviceID))
 		return nil, false
 	}
 	return registration, true
@@ -77,11 +79,21 @@ func requireRegisteredCamera(w http.ResponseWriter, r *http.Request, deviceID st
 func (s *Server) sendCommand(w http.ResponseWriter, r *http.Request, deviceID string, msg ws.Message) bool {
 	if err := s.hub.Send(deviceID, msg); err != nil {
 		if errors.Is(err, ws.ErrDeviceNotConnected) {
-			writeProblem(w, r, http.StatusConflict, fmt.Sprintf("device %q is offline", deviceID))
+			writeProblem(w, r, http.StatusConflict, fmt.Sprintf("device %q is offline: no live websocket", deviceID))
 			return false
 		}
 		slog.Error("send device command", "device_id", deviceID, "type", msg.Type, "error", err)
-		writeProblem(w, r, http.StatusBadGateway, "device connection is unavailable")
+		// The hub error wraps the device id and the client's state, so the
+		// response carries the classified cause instead of the raw text.
+		cause := redact.Text(s.sanitize, err.Error())
+		switch {
+		case errors.Is(err, ws.ErrClientClosed):
+			cause = "the device websocket is closed"
+		case errors.Is(err, ws.ErrSendBufferFull):
+			cause = "the device websocket send buffer is full"
+		}
+		writeProblem(w, r, http.StatusBadGateway,
+			redact.Trim(fmt.Sprintf("sending %s failed: %s", msg.Type, cause), 300))
 		return false
 	}
 	return true
@@ -89,7 +101,7 @@ func (s *Server) sendCommand(w http.ResponseWriter, r *http.Request, deviceID st
 
 // handleCameraSwitch handles POST /api/devices/{device_id}/camera/switch.
 func (s *Server) handleCameraSwitch(w http.ResponseWriter, r *http.Request) {
-	cameraEnum, ok := decodeCameraEnum(w, r)
+	cameraEnum, ok := s.decodeCameraEnum(w, r)
 	if !ok {
 		return
 	}
@@ -118,7 +130,7 @@ func (s *Server) handleCameraSwitch(w http.ResponseWriter, r *http.Request) {
 // It creates the active stream row first and marks it failed when the command
 // cannot be delivered.
 func (s *Server) handleRecordingStart(w http.ResponseWriter, r *http.Request) {
-	cameraEnum, ok := decodeCameraEnum(w, r)
+	cameraEnum, ok := s.decodeCameraEnum(w, r)
 	if !ok {
 		return
 	}
@@ -142,7 +154,7 @@ func (s *Server) handleRecordingStart(w http.ResponseWriter, r *http.Request) {
 			writeProblem(w, r, http.StatusConflict, fmt.Sprintf("camera_enum %d is already streaming on device %q", cameraEnum, deviceID))
 			return
 		}
-		writeStoreError(w, r, err, "device not found")
+		s.writeStoreError(w, r, "create stream", err, "device not found", "")
 		return
 	}
 
@@ -176,7 +188,7 @@ func (s *Server) handleRecordingStart(w http.ResponseWriter, r *http.Request) {
 // handleRecordingStop handles POST /api/devices/{device_id}/recording/stop. It
 // stops the camera's active stream and marks it completed.
 func (s *Server) handleRecordingStop(w http.ResponseWriter, r *http.Request) {
-	cameraEnum, ok := decodeCameraEnum(w, r)
+	cameraEnum, ok := s.decodeCameraEnum(w, r)
 	if !ok {
 		return
 	}
@@ -184,7 +196,8 @@ func (s *Server) handleRecordingStop(w http.ResponseWriter, r *http.Request) {
 
 	stream, err := s.store.Streams.Active(r.Context(), deviceID, cameraEnum)
 	if err != nil {
-		writeStoreError(w, r, err, fmt.Sprintf("no active stream for camera_enum %d on device %q", cameraEnum, deviceID))
+		s.writeStoreError(w, r, "find active stream", err,
+			fmt.Sprintf("no active stream for camera_enum %d on device %q", cameraEnum, deviceID), "")
 		return
 	}
 
@@ -206,7 +219,7 @@ func (s *Server) handleRecordingStop(w http.ResponseWriter, r *http.Request) {
 	}
 	stopped, err := s.store.Streams.Finish(r.Context(), stream.ID, domain.StreamStatusCompleted)
 	if err != nil {
-		writeStoreError(w, r, err, fmt.Sprintf("stream %q not found", stream.ID))
+		s.writeStoreError(w, r, "finish stream", err, fmt.Sprintf("stream %q not found", stream.ID), "")
 		return
 	}
 	writeJSON(w, http.StatusOK, stopped)
@@ -214,7 +227,7 @@ func (s *Server) handleRecordingStop(w http.ResponseWriter, r *http.Request) {
 
 // handlePhotoCapture handles POST /api/devices/{device_id}/photo.
 func (s *Server) handlePhotoCapture(w http.ResponseWriter, r *http.Request) {
-	cameraEnum, ok := decodeCameraEnum(w, r)
+	cameraEnum, ok := s.decodeCameraEnum(w, r)
 	if !ok {
 		return
 	}

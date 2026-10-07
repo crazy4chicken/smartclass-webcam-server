@@ -12,6 +12,7 @@ import (
 	iam "github.com/crazy4chicken/nsc-teamusers/sdk/go"
 
 	"github.com/crazy4chicken/smartclass-webcam-server/internal/domain"
+	"github.com/crazy4chicken/smartclass-webcam-server/internal/redact"
 	"github.com/crazy4chicken/smartclass-webcam-server/internal/store"
 )
 
@@ -59,7 +60,7 @@ func (a *Auth) RequireCollection(action string) func(http.Handler) http.Handler 
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			claims, ok := iam.ClaimsFromContext(r.Context())
 			if !ok {
-				writeUnauthorized(w, r)
+				writeUnauthorized(w, "invalid_request", `the authorization header is missing; send "Authorization: Bearer <access token>"`)
 				return
 			}
 			if a.isDev() {
@@ -78,31 +79,33 @@ func (a *Auth) RequireCollection(action string) func(http.Handler) http.Handler 
 }
 
 // RequireDevice returns middleware that authorizes action against the device
-// returned by load. A missing device becomes 404, a load failure 500, and a
-// denied permission 403 with every key that was tried and the cause each check
-// reported. The matching scope and the loaded device are stored in the request
-// context.
-func (a *Auth) RequireDevice(action string, load func(*http.Request) (*domain.Device, error)) func(http.Handler) http.Handler {
+// returned by load. target names the resource the loader looked up ("device",
+// "stream" or "photo"): a missing one becomes 404 with that name and a load
+// failure 500 with the cause. A denied permission answers 403 with every key
+// that was tried and the cause each check reported. The matching scope and the
+// loaded device are stored in the request context.
+func (a *Auth) RequireDevice(action, target string, load func(*http.Request) (*domain.Device, error)) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			claims, ok := iam.ClaimsFromContext(r.Context())
 			if !ok {
-				writeUnauthorized(w, r)
+				writeUnauthorized(w, "invalid_request", `the authorization header is missing; send "Authorization: Bearer <access token>"`)
 				return
 			}
 
 			device, err := load(r)
 			if err != nil {
 				if errors.Is(err, store.ErrNotFound) {
-					writeProblem(w, r, http.StatusNotFound, "resource not found")
+					writeProblem(w, r, http.StatusNotFound, target+" not found")
 					return
 				}
-				slog.Error("load device for authorization", "method", r.Method, "path", r.URL.Path, "error", err)
-				writeProblem(w, r, http.StatusInternalServerError, "internal server error")
+				slog.Error("load "+target+" for authorization", "method", r.Method, "path", r.URL.Path, "error", err)
+				writeProblem(w, r, http.StatusInternalServerError,
+					redact.Trim("loading the "+target+" failed: "+redact.Text(a.sanitize, err.Error()), 300))
 				return
 			}
 			if device == nil {
-				writeProblem(w, r, http.StatusNotFound, "device not found")
+				writeProblem(w, r, http.StatusNotFound, target+" not found")
 				return
 			}
 
@@ -191,14 +194,24 @@ func permissionKey(action, scope string) string {
 	return camResource + ":" + action + ":" + scope
 }
 
-// writeUnauthorized rejects a request that carries no verified identity. It
-// writes the same decision body the teamusers middleware emits for
-// unauthenticated requests.
-func writeUnauthorized(w http.ResponseWriter, _ *http.Request) {
-	w.Header().Set("WWW-Authenticate", `Bearer realm="teamusers"`)
+// writeUnauthorized rejects a request that carries no usable identity, naming
+// the cause in both the teamusers decision body and the Bearer challenge.
+func writeUnauthorized(w http.ResponseWriter, code, reason string) {
+	w.Header().Set("WWW-Authenticate", authorizationChallenge(code, reason))
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusUnauthorized)
-	_ = json.NewEncoder(w).Encode(decisionResponse{Allow: false, Reason: "authentication is required"})
+	_ = json.NewEncoder(w).Encode(decisionResponse{Allow: false, Reason: reason})
+}
+
+// authorizationChallenge builds the Bearer challenge carrying the same cause as
+// the decision body, per RFC 6750.
+func authorizationChallenge(code, reason string) string {
+	return `Bearer realm="teamusers", error="` + code + `", error_description="` + quoteHeaderValue(reason) + `"`
+}
+
+// quoteHeaderValue escapes a value for a quoted-string header parameter.
+func quoteHeaderValue(value string) string {
+	return strings.NewReplacer(`\`, `\\`, `"`, `\"`, "\r", " ", "\n", " ").Replace(value)
 }
 
 // decisionResponse mirrors the body the teamusers middleware writes for

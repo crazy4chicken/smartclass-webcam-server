@@ -19,6 +19,7 @@ import (
 	"github.com/crazy4chicken/smartclass-webcam-server/internal/auth"
 	"github.com/crazy4chicken/smartclass-webcam-server/internal/config"
 	"github.com/crazy4chicken/smartclass-webcam-server/internal/httpapi"
+	"github.com/crazy4chicken/smartclass-webcam-server/internal/redact"
 	"github.com/crazy4chicken/smartclass-webcam-server/internal/storage"
 	"github.com/crazy4chicken/smartclass-webcam-server/internal/store"
 	"github.com/crazy4chicken/smartclass-webcam-server/internal/ws"
@@ -88,6 +89,10 @@ func run() error {
 	// and every request is accepted with a synthetic subject. The token
 	// source is shared with object storage so both use one refreshed
 	// service credential.
+	//
+	// Error causes copied into a response body pass through sanitize first,
+	// so no configured credential can reach a caller.
+	sanitize := redact.New(cfg.Secrets()...)
 	var (
 		authn     *auth.Auth
 		svcTokens *auth.ClientCredentialsTokenSource
@@ -112,7 +117,7 @@ func run() error {
 			slog.Warn("no teamusers service credential configured; permission checks will fail closed")
 		}
 
-		authn, err = auth.New(cfg.TeamusersURL, cfg.TeamusersAud, opts...)
+		authn, err = auth.New(cfg.TeamusersURL, cfg.TeamusersAud, sanitize, opts...)
 		if err != nil {
 			return fmt.Errorf("create auth: %w", err)
 		}
@@ -136,7 +141,7 @@ func run() error {
 
 	srv := &http.Server{
 		Addr:    cfg.ListenAddr,
-		Handler: httpapi.NewRouter(authn, st, hub, registry, objStore),
+		Handler: httpapi.NewRouter(authn, st, hub, registry, objStore, sanitize),
 		// ReadHeaderTimeout only: WebSocket connections are long-lived and
 		// would be cut short by a write timeout.
 		ReadHeaderTimeout: 10 * time.Second,

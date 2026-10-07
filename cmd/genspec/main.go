@@ -28,7 +28,7 @@ func main() {
 func generate() error {
 	// chi.Walk only inspects route patterns, so the router is built with inert
 	// stubs: no database or network connection is opened at generation time.
-	router := httpapi.NewRouter(auth.NewDevAuth(), store.New(nil), ws.NewHub(), ws.NewRegistry(60*time.Second), storage.NoopStorage{})
+	router := httpapi.NewRouter(auth.NewDevAuth(), store.New(nil), ws.NewHub(), ws.NewRegistry(60*time.Second), storage.NoopStorage{}, nil)
 
 	operations, err := apidocs.Collect(router, httpapi.DocOperations, httpapi.DocPermissionDeriver)
 	if err != nil {
@@ -58,7 +58,7 @@ func writeSpec(path string, operations []apidocs.Operation) error {
 
 	options := apidocs.EmitOptions{
 		Title:   "SmartClass Webcam Server API",
-		Version: "0.2.3",
+		Version: "0.2.4",
 		Servers: []apidocs.Server{{
 			URL:         "http://localhost:8080",
 			Description: "Local server (default WEBCAM_LISTEN_ADDR)",

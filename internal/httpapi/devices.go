@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"errors"
 	"net/http"
 	"strings"
 
@@ -46,11 +47,14 @@ type deviceDetail struct {
 }
 
 // requireGrant returns the access grant attached by the authorization
-// middleware. Its absence means the route was mounted without that middleware.
-func requireGrant(w http.ResponseWriter, r *http.Request) (auth.AccessGrant, bool) {
+// middleware. Its absence means the request reached the handler without an
+// access grant, which only a route mounted without RequireCollection or
+// RequireDevice can produce.
+func (s *Server) requireGrant(w http.ResponseWriter, r *http.Request) (auth.AccessGrant, bool) {
 	grant, ok := auth.GrantFromContext(r.Context())
 	if !ok {
-		writeProblem(w, r, http.StatusInternalServerError, "access grant is unavailable")
+		s.fail(w, r, "authorize request", errors.New(
+			"the request reached the handler without an access grant: the route is mounted without its authorization middleware"))
 		return auth.AccessGrant{}, false
 	}
 	return grant, true
@@ -64,12 +68,12 @@ func (s *Server) loadDeviceFromPath(r *http.Request) (*domain.Device, error) {
 
 // handleDeviceCreate handles POST /api/devices.
 func (s *Server) handleDeviceCreate(w http.ResponseWriter, r *http.Request) {
-	grant, ok := requireGrant(w, r)
+	grant, ok := s.requireGrant(w, r)
 	if !ok {
 		return
 	}
 	var req deviceCreateRequest
-	if !decodeJSON(w, r, &req) {
+	if !s.decodeJSON(w, r, &req) {
 		return
 	}
 	name := strings.TrimSpace(req.Name)
@@ -98,7 +102,7 @@ func (s *Server) handleDeviceCreate(w http.ResponseWriter, r *http.Request) {
 
 	created, err := s.store.Devices.Create(r.Context(), device)
 	if err != nil {
-		writeStoreError(w, r, err, "device not found")
+		s.writeStoreError(w, r, "create device", err, "device not found", "a device with this id already exists")
 		return
 	}
 	w.Header().Set("Location", "/api/devices/"+created.ID)
@@ -107,7 +111,7 @@ func (s *Server) handleDeviceCreate(w http.ResponseWriter, r *http.Request) {
 
 // handleDeviceList handles GET /api/devices.
 func (s *Server) handleDeviceList(w http.ResponseWriter, r *http.Request) {
-	grant, ok := requireGrant(w, r)
+	grant, ok := s.requireGrant(w, r)
 	if !ok {
 		return
 	}
@@ -126,7 +130,7 @@ func (s *Server) handleDeviceList(w http.ResponseWriter, r *http.Request) {
 
 	devices, err := s.store.Devices.List(r.Context(), filter)
 	if err != nil {
-		writeStoreError(w, r, err, "devices not found")
+		s.writeStoreError(w, r, "list devices", err, "devices not found", "")
 		return
 	}
 	writeJSON(w, http.StatusOK, newListResponse(devices))
@@ -134,7 +138,7 @@ func (s *Server) handleDeviceList(w http.ResponseWriter, r *http.Request) {
 
 // handleDeviceGet handles GET /api/devices/{device_id}/.
 func (s *Server) handleDeviceGet(w http.ResponseWriter, r *http.Request) {
-	grant, ok := requireGrant(w, r)
+	grant, ok := s.requireGrant(w, r)
 	if !ok {
 		return
 	}
@@ -160,12 +164,12 @@ func (s *Server) deviceDetail(device *domain.Device) deviceDetail {
 // is partial: present fields overwrite the stored values, absent fields are
 // kept.
 func (s *Server) handleDeviceUpdate(w http.ResponseWriter, r *http.Request) {
-	grant, ok := requireGrant(w, r)
+	grant, ok := s.requireGrant(w, r)
 	if !ok {
 		return
 	}
 	var req deviceUpdateRequest
-	if !decodeJSON(w, r, &req) {
+	if !s.decodeJSON(w, r, &req) {
 		return
 	}
 
@@ -200,7 +204,7 @@ func (s *Server) handleDeviceUpdate(w http.ResponseWriter, r *http.Request) {
 
 	device, err := s.store.Devices.Update(r.Context(), chi.URLParam(r, "device_id"), upd)
 	if err != nil {
-		writeStoreError(w, r, err, "device not found")
+		s.writeStoreError(w, r, "update device", err, "device not found", "")
 		return
 	}
 	writeJSON(w, http.StatusOK, device)
@@ -212,7 +216,7 @@ func (s *Server) handleDeviceUpdate(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleDeviceDelete(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "device_id")
 	if err := s.store.Devices.Delete(r.Context(), id); err != nil {
-		writeStoreError(w, r, err, "device not found")
+		s.writeStoreError(w, r, "delete device", err, "device not found", "")
 		return
 	}
 	if client := s.registry.Invalidate(id); client != nil {
@@ -228,7 +232,7 @@ func (s *Server) handleDeviceTokenRotate(w http.ResponseWriter, r *http.Request)
 	token, hash := auth.GenerateDeviceToken()
 	device, err := s.store.Devices.SetTokenHash(r.Context(), id, hash)
 	if err != nil {
-		writeStoreError(w, r, err, "device not found")
+		s.writeStoreError(w, r, "rotate device token", err, "device not found", "")
 		return
 	}
 	if client := s.registry.Invalidate(id); client != nil {
