@@ -44,6 +44,9 @@ const (
 const (
 	PKStreamID    = "stream_id"
 	PKCameraEnum  = "camera_enum"
+	PKResolution  = "resolution"
+	PKFPS         = "fps"
+	PKCodec       = "codec"
 	PKSeq         = "seq"
 	PKTS          = "ts"
 	PKRequestID   = "request_id"

@@ -3,6 +3,7 @@ package httpapi
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -31,42 +32,7 @@ import (
 // WEBCAM_TEST_DB_URL points at one. The schema is created and migrated on the
 // fly, and every row it writes belongs to the run.
 func TestEndpointErrorDetails(t *testing.T) {
-	dsn := os.Getenv("WEBCAM_TEST_DB_URL")
-	if dsn == "" {
-		t.Skip("set WEBCAM_TEST_DB_URL to a scratch PostgreSQL database to run the endpoint error matrix")
-	}
-
-	ctx := context.Background()
-	pool, err := store.NewPool(ctx, dsn)
-	if err != nil {
-		t.Fatalf("open database: %v", err)
-	}
-	defer pool.Close()
-	if err := store.RunMigrations(ctx, pool); err != nil {
-		t.Fatalf("run migrations: %v", err)
-	}
-
-	secret := dbPassword(dsn)
-	sanitize := redact.New(secret)
-	stub := iamtest.New(t, "webcam")
-	stub.SetGrants(operator, 7,
-		`{"key":"cam:read:any"}`,
-		`{"key":"cam:manage:any"}`,
-		`{"key":"cam:control:any"}`)
-	stub.SetGrants(stranger, 7)
-
-	authn, err := auth.New(stub.URL(), "webcam", sanitize, iam.WithServiceToken("svc-token"))
-	if err != nil {
-		t.Fatalf("create auth: %v", err)
-	}
-	defer func() { _ = authn.Close() }()
-
-	m := &matrix{
-		t:      t,
-		router: NewRouter(authn, store.New(pool), ws.NewHub(), ws.NewRegistry(time.Minute), storage.NoopStorage{}, sanitize),
-		stub:   stub,
-		secret: secret,
-	}
+	m := newMatrix(t)
 
 	// Public routes stay open and answer their documented bodies.
 	m.check("health", call{method: http.MethodGet, path: "/healthz"}, http.StatusOK, `"status":"ok"`)
@@ -85,10 +51,10 @@ func TestEndpointErrorDetails(t *testing.T) {
 	m.check("list, foreign audience", call{method: http.MethodGet, path: "/api/devices", token: m.mutatedToken("aud", "elsewhere")}, http.StatusUnauthorized,
 		`access token audience is not "webcam"`)
 	m.check("list, foreign signature", call{method: http.MethodGet, path: "/api/devices",
-		token: stub.ForeignToken(iamtest.PublishedKid, stub.Claims(operator, "t1", 7))}, http.StatusUnauthorized,
+		token: m.stub.ForeignToken(iamtest.PublishedKid, m.stub.Claims(operator, "t1", 7))}, http.StatusUnauthorized,
 		"access token signature matches no key in the issuer's JWKS document")
 	m.check("list, unknown key", call{method: http.MethodGet, path: "/api/devices",
-		token: stub.ForeignToken("key-9", stub.Claims(operator, "t1", 7))}, http.StatusUnauthorized,
+		token: m.stub.ForeignToken("key-9", m.stub.Claims(operator, "t1", 7))}, http.StatusUnauthorized,
 		`access token names a signing key the issuer does not publish (kid "key-9")`)
 
 	// Authorization names every key the ladder tried.
@@ -104,8 +70,8 @@ func TestEndpointErrorDetails(t *testing.T) {
 	m.check("create, no name", call{method: http.MethodPost, path: "/api/devices", body: `{}`}, http.StatusBadRequest,
 		"name is required")
 
-	device := m.createDevice("matrix device")
-	spare := m.createDevice("matrix spare")
+	device, deviceToken := m.createDevice("matrix device")
+	spare, _ := m.createDevice("matrix spare")
 
 	m.check("get, unknown device", call{method: http.MethodGet, path: "/api/devices/" + newID() + "/"}, http.StatusNotFound,
 		"device not found")
@@ -118,7 +84,7 @@ func TestEndpointErrorDetails(t *testing.T) {
 		"device not found")
 	m.check("delete, unknown device", call{method: http.MethodDelete, path: "/api/devices/" + newID() + "/"}, http.StatusNotFound,
 		"device not found")
-	m.check("rotate token", call{method: http.MethodPost, path: "/api/devices/" + device + "/token"}, http.StatusOK, `"token"`)
+	deviceToken = m.rotateToken(device)
 
 	m.check("switch, no camera_enum", call{method: http.MethodPost, path: "/api/devices/" + device + "/camera/switch", body: `{}`}, http.StatusBadRequest,
 		"camera_enum is required")
@@ -139,6 +105,20 @@ func TestEndpointErrorDetails(t *testing.T) {
 		"stream not found")
 	m.check("photo, unknown", call{method: http.MethodGet, path: "/api/photos/" + newID() + "/"}, http.StatusNotFound,
 		"photo not found")
+
+	// A device announces its cameras: the parameters each camera is at for the
+	// connection plus everything it supports, and the device plane rejects a
+	// report whose current parameters are not among them.
+	m.check("register, missing support lists", call{method: http.MethodGet, path: "/ws/register", body: `{"device_id":"` + device + `","cameras":[{"camera_enum":0,"resolution":"1920x1080","fps":30,"supported_codec":["h264"]}]}`, auth: "Bearer " + deviceToken}, http.StatusBadRequest,
+		"cameras[0].supported_resolutions must not be empty")
+	m.check("register, current resolution unlisted", call{method: http.MethodGet, path: "/ws/register", body: `{"device_id":"` + device + `","cameras":[{"camera_enum":0,"resolution":"3840x2160","fps":30,"supported_resolutions":["1920x1080"],"supported_framerates":[30],"supported_codec":["h264"]}]}`, auth: "Bearer " + deviceToken}, http.StatusBadRequest,
+		"cameras[0].resolution must be one of the supported_resolutions")
+	m.check("register, current fps unlisted", call{method: http.MethodGet, path: "/ws/register", body: `{"device_id":"` + device + `","cameras":[{"camera_enum":0,"resolution":"1920x1080","fps":60,"supported_resolutions":["1920x1080"],"supported_framerates":[30,15],"supported_codec":["h264"]}]}`, auth: "Bearer " + deviceToken}, http.StatusBadRequest,
+		"cameras[0].fps must be one of the supported_framerates")
+	m.check("register, repeated frame rate", call{method: http.MethodGet, path: "/ws/register", body: `{"device_id":"` + device + `","cameras":[{"camera_enum":0,"resolution":"1920x1080","fps":30,"supported_resolutions":["1920x1080"],"supported_framerates":[30,30],"supported_codec":["h264"]}]}`, auth: "Bearer " + deviceToken}, http.StatusBadRequest,
+		"cameras[0].supported_framerates must not contain duplicates")
+	m.check("register", call{method: http.MethodGet, path: "/ws/register", body: registration(device, "1920x1080", 30), auth: "Bearer " + deviceToken}, http.StatusOK,
+		`"device_websocket_id"`)
 
 	// The device plane carries its own credential and names its own failures.
 	// The registration route decodes its body before it looks at the token, so
@@ -163,7 +143,7 @@ func TestEndpointErrorDetails(t *testing.T) {
 		"method PUT is not allowed on /healthz; allowed: GET")
 
 	// A dependency failure names the operation and the cause.
-	m.checkDependencyFailure(dsn, sanitize, stub)
+	m.checkDependencyFailure()
 
 	m.check("delete", call{method: http.MethodDelete, path: "/api/devices/" + spare + "/"}, http.StatusNoContent, "")
 }
@@ -177,10 +157,72 @@ const (
 
 // matrix is one running service under test.
 type matrix struct {
-	t      *testing.T
-	router http.Handler
-	stub   *iamtest.Stub
-	secret string
+	t        *testing.T
+	router   http.Handler
+	stub     *iamtest.Stub
+	sanitize func(string) string
+	secret   string
+	dsn      string
+	base     string // listener serving the router, created on first use
+}
+
+// newMatrix builds the service under test: a real schema in a scratch
+// PostgreSQL database, the teamusers stub, and the router over a no-op object
+// storage. The test is skipped unless WEBCAM_TEST_DB_URL points at the scratch
+// database.
+func newMatrix(t *testing.T) *matrix {
+	t.Helper()
+	dsn := os.Getenv("WEBCAM_TEST_DB_URL")
+	if dsn == "" {
+		t.Skip("set WEBCAM_TEST_DB_URL to a scratch PostgreSQL database to run the endpoint matrix")
+	}
+
+	ctx := context.Background()
+	pool, err := store.NewPool(ctx, dsn)
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	t.Cleanup(pool.Close)
+	if err := store.RunMigrations(ctx, pool); err != nil {
+		t.Fatalf("run migrations: %v", err)
+	}
+
+	secret := dbPassword(dsn)
+	sanitize := redact.New(secret)
+	stub := iamtest.New(t, "webcam")
+	stub.SetGrants(operator, 7,
+		`{"key":"cam:read:any"}`,
+		`{"key":"cam:manage:any"}`,
+		`{"key":"cam:control:any"}`)
+	stub.SetGrants(stranger, 7)
+
+	authn, err := auth.New(stub.URL(), "webcam", sanitize, iam.WithServiceToken("svc-token"))
+	if err != nil {
+		t.Fatalf("create auth: %v", err)
+	}
+	t.Cleanup(func() { _ = authn.Close() })
+
+	return &matrix{
+		t:        t,
+		router:   NewRouter(authn, store.New(pool), ws.NewHub(), ws.NewRegistry(time.Minute), storage.NoopStorage{}, sanitize),
+		stub:     stub,
+		sanitize: sanitize,
+		secret:   secret,
+		dsn:      dsn,
+	}
+}
+
+// listen serves the router on a real listener, which the device plane needs to
+// dial the WebSocket route.
+func (m *matrix) listen() string {
+	m.t.Helper()
+	if m.base != "" {
+		return m.base
+	}
+	server := httptest.NewServer(m.router)
+	m.t.Cleanup(server.Close)
+	m.base = server.URL
+	return m.base
 }
 
 // call describes one request against the router. Unless anonymous or an
@@ -249,21 +291,21 @@ func (m *matrix) check(name string, c call, status int, contains string) *httpte
 // checkDependencyFailure proves a 500 names the failing operation and its cause
 // rather than a bare "internal server error", using a pool that is already
 // closed.
-func (m *matrix) checkDependencyFailure(dsn string, sanitize func(string) string, stub *iamtest.Stub) {
+func (m *matrix) checkDependencyFailure() {
 	m.t.Helper()
-	broken, err := store.NewPool(context.Background(), dsn)
+	broken, err := store.NewPool(context.Background(), m.dsn)
 	if err != nil {
 		m.t.Fatalf("open broken pool: %v", err)
 	}
 	broken.Close()
 
-	authn, err := auth.New(stub.URL(), "webcam", sanitize, iam.WithServiceToken("svc-token"))
+	authn, err := auth.New(m.stub.URL(), "webcam", m.sanitize, iam.WithServiceToken("svc-token"))
 	if err != nil {
 		m.t.Fatalf("create auth: %v", err)
 	}
 	defer func() { _ = authn.Close() }()
 
-	router := NewRouter(authn, store.New(broken), ws.NewHub(), ws.NewRegistry(time.Minute), storage.NoopStorage{}, sanitize)
+	router := NewRouter(authn, store.New(broken), ws.NewHub(), ws.NewRegistry(time.Minute), storage.NoopStorage{}, m.sanitize)
 	r := httptest.NewRequest(http.MethodGet, "/api/devices", nil)
 	r.Header.Set("Authorization", "Bearer "+m.token(operator))
 	recorder := httptest.NewRecorder()
@@ -300,8 +342,9 @@ func (m *matrix) expiredToken() string {
 	return m.stub.Token(iamtest.PublishedKid, claims)
 }
 
-// createDevice registers a device through the API and returns its id.
-func (m *matrix) createDevice(name string) string {
+// createDevice registers a device through the API and returns its id together
+// with the plaintext device token the creation response carries.
+func (m *matrix) createDevice(name string) (string, string) {
 	m.t.Helper()
 	recorder := m.check("create "+name, call{method: http.MethodPost, path: "/api/devices",
 		body: `{"name":"` + name + `"}`, token: m.token(operator)}, http.StatusCreated, `"token"`)
@@ -310,14 +353,40 @@ func (m *matrix) createDevice(name string) string {
 		Device struct {
 			ID string `json:"id"`
 		} `json:"device"`
+		Token string `json:"token"`
 	}
 	if err := json.Unmarshal(recorder.Body.Bytes(), &envelope); err != nil {
 		m.t.Fatalf("decode created device %q: %v", recorder.Body.String(), err)
 	}
-	if envelope.Device.ID == "" {
-		m.t.Fatalf("created device carries no id: %q", recorder.Body.String())
+	if envelope.Device.ID == "" || envelope.Token == "" {
+		m.t.Fatalf("created device carries no id or token: %q", recorder.Body.String())
 	}
-	return envelope.Device.ID
+	return envelope.Device.ID, envelope.Token
+}
+
+// rotateToken rotates a device token through the API and returns the new
+// plaintext token, which is the only one the device plane accepts afterwards.
+func (m *matrix) rotateToken(deviceID string) string {
+	m.t.Helper()
+	recorder := m.check("rotate token", call{method: http.MethodPost, path: "/api/devices/" + deviceID + "/token"},
+		http.StatusOK, `"token"`)
+	var envelope struct {
+		Token string `json:"token"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &envelope); err != nil || envelope.Token == "" {
+		m.t.Fatalf("rotate response carries no token: %q", recorder.Body.String())
+	}
+	return envelope.Token
+}
+
+// registration builds a camera registration body whose current parameters are
+// one of the supported ones.
+func registration(deviceID, resolution string, fps int) string {
+	return fmt.Sprintf(
+		`{"device_id":%q,"cameras":[{"camera_enum":0,"resolution":%q,"fps":%d,`+
+			`"supported_resolutions":["1920x1080","1280x720"],"supported_framerates":[30,15],`+
+			`"supported_codec":["h264","mjpeg"],"attrs":{"label":"front"}}]}`,
+		deviceID, resolution, fps)
 }
 
 // causeOf returns the human-readable cause of a problem or decision body.

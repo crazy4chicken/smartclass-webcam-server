@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -26,7 +27,23 @@ const (
 	storageTimeout = 30 * time.Second
 	// segmentContentType is the content type of flushed segment payloads.
 	segmentContentType = "application/octet-stream"
+	// photoContentType is the only content type a stored photo can carry:
+	// still images are JPEG by protocol.
+	photoContentType = "image/jpeg"
 )
+
+// jpegOrEmpty normalizes the content type a device declared for a photo frame
+// and reports whether the server accepts it. An absent value means the
+// canonical one, because the protocol fixes photos to JPEG; any other value is
+// rejected.
+func jpegOrEmpty(declared string) (string, bool) {
+	normalized := strings.ToLower(strings.TrimSpace(declared))
+	switch normalized {
+	case "", photoContentType:
+		return photoContentType, true
+	}
+	return normalized, false
+}
 
 // mediaManager accumulates recording frames per stream and flushes them to
 // object storage as segments; it also stores photos pushed by devices. Frames
@@ -158,14 +175,19 @@ func (m *mediaManager) handleRecording(deviceID, streamID string, cameraEnum int
 }
 
 // handlePhoto stores a still image pushed by a device. The row is written only
-// after the upload succeeded.
+// after the upload succeeded. Still images are JPEG by protocol, so the
+// declared content type is either the canonical one or absent, and anything
+// else is discarded.
 func (m *mediaManager) handlePhoto(deviceID string, cameraEnum int, requestID, contentType string, ts time.Time, data []byte) {
 	if !m.cameraLive(deviceID, cameraEnum) {
 		slog.Debug("discarding photo for unknown camera", "device_id", deviceID, "camera_enum", cameraEnum)
 		return
 	}
-	if contentType == "" {
-		contentType = segmentContentType
+	contentType, ok := jpegOrEmpty(contentType)
+	if !ok {
+		slog.Warn("discarding photo with an unsupported content type",
+			"device_id", deviceID, "camera_enum", cameraEnum, "content_type", contentType)
+		return
 	}
 	if ts.IsZero() {
 		ts = time.Now().UTC()

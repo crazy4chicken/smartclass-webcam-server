@@ -87,7 +87,7 @@ func (s *Server) handleDeviceRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	reg, err := s.registry.Create(device.ID, req.Cameras)
+	reg, err := s.registry.Create(device.ID, normalizedCameras(req.Cameras))
 	if err != nil {
 		s.fail(w, r, "issue device websocket ticket", err)
 		return
@@ -163,10 +163,13 @@ func (s *Server) handleDeviceWS(w http.ResponseWriter, r *http.Request) {
 }
 
 // validateCameraCapabilities enforces the registration rules: cameras are
-// numbered 0..n-1 in order, each declaring a resolution, a positive frame rate
-// and at least one codec from the closed vocabulary (ws.SupportedCodecNames)
-// without duplicates. Registration is the only gate, so a live registration
-// never carries an unknown or repeated codec.
+// numbered 0..n-1 in order, each declaring the parameters it is currently at
+// together with the resolutions and frame rates it supports - the current pair
+// among them, since a device captures from one camera at one resolution and
+// one frame rate at a time - and at least one codec from the closed vocabulary
+// (ws.SupportedCodecNames) without duplicates. Registration is the only gate,
+// so a live registration never carries a parameter or codec the camera did not
+// declare.
 func validateCameraCapabilities(cameras []ws.CameraCapability) error {
 	if len(cameras) == 0 {
 		return errors.New("cameras must not be empty")
@@ -177,13 +180,50 @@ func validateCameraCapabilities(cameras []ws.CameraCapability) error {
 			return fmt.Errorf("cameras[%d].camera_enum must be %d", i, i)
 		case strings.TrimSpace(cam.Resolution) == "":
 			return fmt.Errorf("cameras[%d].resolution must not be empty", i)
+		case len(cam.SupportedResolutions) == 0:
+			return fmt.Errorf("cameras[%d].supported_resolutions must not be empty", i)
 		case cam.FPS <= 0:
 			return fmt.Errorf("cameras[%d].fps must be positive", i)
+		case len(cam.SupportedFramerates) == 0:
+			return fmt.Errorf("cameras[%d].supported_framerates must not be empty", i)
 		case len(cam.SupportedCodec) == 0:
 			return fmt.Errorf("cameras[%d].supported_codec must not be empty", i)
 		}
-		// Every element must come from the closed vocabulary, and no codec may
-		// be listed twice.
+
+		// The supported resolutions list every resolution the camera accepts,
+		// the one it is at included, without repetitions.
+		resolutions := make(map[string]struct{}, len(cam.SupportedResolutions))
+		for j, resolution := range cam.SupportedResolutions {
+			resolution = strings.TrimSpace(resolution)
+			if resolution == "" {
+				return fmt.Errorf("cameras[%d].supported_resolutions[%d] must not be empty", i, j)
+			}
+			resolutions[resolution] = struct{}{}
+		}
+		if len(resolutions) != len(cam.SupportedResolutions) {
+			return fmt.Errorf("cameras[%d].supported_resolutions must not contain duplicates", i)
+		}
+		if _, ok := resolutions[strings.TrimSpace(cam.Resolution)]; !ok {
+			return fmt.Errorf("cameras[%d].resolution must be one of the supported_resolutions", i)
+		}
+
+		// The supported frame rates follow the same rules.
+		framerates := make(map[int]struct{}, len(cam.SupportedFramerates))
+		for j, fps := range cam.SupportedFramerates {
+			if fps <= 0 {
+				return fmt.Errorf("cameras[%d].supported_framerates[%d] must be positive", i, j)
+			}
+			framerates[fps] = struct{}{}
+		}
+		if len(framerates) != len(cam.SupportedFramerates) {
+			return fmt.Errorf("cameras[%d].supported_framerates must not contain duplicates", i)
+		}
+		if _, ok := framerates[cam.FPS]; !ok {
+			return fmt.Errorf("cameras[%d].fps must be one of the supported_framerates", i)
+		}
+
+		// Every codec must come from the closed vocabulary, and none may be
+		// listed twice.
 		seen := make(map[string]struct{}, len(cam.SupportedCodec))
 		for j, codec := range cam.SupportedCodec {
 			if !ws.IsSupportedCodec(codec) {
@@ -196,6 +236,25 @@ func validateCameraCapabilities(cameras []ws.CameraCapability) error {
 		}
 	}
 	return nil
+}
+
+// normalizedCameras trims the resolution strings of an accepted registration,
+// so the live session holds the values the validation compared: a switch may
+// then select any entry the device listed, whatever padding it sent.
+func normalizedCameras(cameras []ws.CameraCapability) []ws.CameraCapability {
+	normalized := make([]ws.CameraCapability, 0, len(cameras))
+	for _, camera := range cameras {
+		camera.Resolution = strings.TrimSpace(camera.Resolution)
+		if camera.SupportedResolutions != nil {
+			resolutions := make([]string, 0, len(camera.SupportedResolutions))
+			for _, resolution := range camera.SupportedResolutions {
+				resolutions = append(resolutions, strings.TrimSpace(resolution))
+			}
+			camera.SupportedResolutions = resolutions
+		}
+		normalized = append(normalized, camera)
+	}
+	return normalized
 }
 
 // deviceTokenRejected is the one reason a well-formed device credential is

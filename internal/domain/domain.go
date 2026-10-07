@@ -26,7 +26,10 @@ type Device struct {
 	TokenHash []byte     `json:"-"`
 }
 
-// StreamMetadata snapshots the camera parameters a stream was started with.
+// StreamMetadata snapshots the camera parameters a stream was started with:
+// the resolution and frame rate the camera was at, the codec the caller asked
+// for - empty when the device chose its preferred one - and every codec the
+// camera supports.
 type StreamMetadata struct {
 	Resolution string   `json:"resolution,omitempty"`
 	FPS        int      `json:"fps,omitempty"`

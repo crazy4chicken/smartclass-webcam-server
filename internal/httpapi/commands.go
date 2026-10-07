@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"slices"
+	"strings"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/oklog/ulid/v2"
@@ -15,9 +17,30 @@ import (
 	"github.com/crazy4chicken/smartclass-webcam-server/internal/ws"
 )
 
-// cameraCommandRequest is the body of the device command endpoints.
+// cameraCommandRequest is the body of the endpoints that act on the camera the
+// device is already using: stop-recording and take-photo.
 type cameraCommandRequest struct {
 	CameraEnum *int `json:"camera_enum"`
+}
+
+// switchRequest is the body of the switch-camera endpoint: the camera to
+// select and, optionally, the parameters to select it at. Both parameters must
+// be ones the camera declared during registration; leaving one out switches
+// without changing it, so a switch to another camera leaves that camera at the
+// parameters it reported.
+type switchRequest struct {
+	CameraEnum *int   `json:"camera_enum"`
+	Resolution string `json:"resolution"`
+	FPS        *int   `json:"fps"`
+}
+
+// recordingStartRequest is the body of the recording-start endpoint: the
+// camera to record and, optionally, the codec to record it with. An omitted
+// codec leaves the choice to the device, which uses its preferred one - the
+// first entry of the camera's supported_codec.
+type recordingStartRequest struct {
+	CameraEnum *int   `json:"camera_enum"`
+	Codec      string `json:"codec"`
 }
 
 // commandResponse is the body of the switch-camera command response.
@@ -99,10 +122,17 @@ func (s *Server) sendCommand(w http.ResponseWriter, r *http.Request, deviceID st
 	return true
 }
 
-// handleCameraSwitch handles POST /api/devices/{device_id}/camera/switch.
+// handleCameraSwitch handles POST /api/devices/{device_id}/camera/switch. The
+// device switches to the requested camera and, when the request names them, to
+// the requested resolution and frame rate; both must be ones the camera
+// declared during registration.
 func (s *Server) handleCameraSwitch(w http.ResponseWriter, r *http.Request) {
-	cameraEnum, ok := s.decodeCameraEnum(w, r)
-	if !ok {
+	var req switchRequest
+	if !s.decodeJSON(w, r, &req) {
+		return
+	}
+	if req.CameraEnum == nil {
+		writeProblem(w, r, http.StatusBadRequest, "camera_enum is required")
 		return
 	}
 	deviceID := chi.URLParam(r, "device_id")
@@ -110,30 +140,55 @@ func (s *Server) handleCameraSwitch(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if _, ok := requireRegisteredCamera(w, r, deviceID, registration, cameraEnum); !ok {
+	camera, ok := requireRegisteredCamera(w, r, deviceID, registration, *req.CameraEnum)
+	if !ok {
 		return
+	}
+
+	payload := map[string]any{ws.PKCameraEnum: camera.CameraEnum}
+	if resolution := strings.TrimSpace(req.Resolution); resolution != "" {
+		if !slices.Contains(camera.SupportedResolutions, resolution) {
+			writeProblem(w, r, http.StatusBadRequest,
+				fmt.Sprintf("resolution %q is not supported by camera_enum %d on device %q", resolution, camera.CameraEnum, deviceID))
+			return
+		}
+		payload[ws.PKResolution] = resolution
+	}
+	if req.FPS != nil {
+		if !slices.Contains(camera.SupportedFramerates, *req.FPS) {
+			writeProblem(w, r, http.StatusBadRequest,
+				fmt.Sprintf("fps %d is not supported by camera_enum %d on device %q", *req.FPS, camera.CameraEnum, deviceID))
+			return
+		}
+		payload[ws.PKFPS] = *req.FPS
 	}
 
 	msg := ws.Message{
 		Channel: ws.ChannelControl,
 		Type:    ws.CommandSwitchCamera,
 		ID:      ulid.Make().String(),
-		Payload: map[string]any{ws.PKCameraEnum: cameraEnum},
+		Payload: payload,
 	}
 	if !s.sendCommand(w, r, deviceID, msg) {
 		return
 	}
-	writeJSON(w, http.StatusAccepted, commandResponse{CommandID: msg.ID, CameraEnum: cameraEnum})
+	writeJSON(w, http.StatusAccepted, commandResponse{CommandID: msg.ID, CameraEnum: camera.CameraEnum})
 }
 
 // handleRecordingStart handles POST /api/devices/{device_id}/recording/start.
 // It creates the active stream row first and marks it failed when the command
-// cannot be delivered.
+// cannot be delivered. The recording runs on the camera's current parameters;
+// only the codec can be chosen, and only here.
 func (s *Server) handleRecordingStart(w http.ResponseWriter, r *http.Request) {
-	cameraEnum, ok := s.decodeCameraEnum(w, r)
-	if !ok {
+	var req recordingStartRequest
+	if !s.decodeJSON(w, r, &req) {
 		return
 	}
+	if req.CameraEnum == nil {
+		writeProblem(w, r, http.StatusBadRequest, "camera_enum is required")
+		return
+	}
+	cameraEnum := *req.CameraEnum
 	deviceID := chi.URLParam(r, "device_id")
 	registration, ok := s.requireLiveDevice(w, r, deviceID)
 	if !ok {
@@ -144,9 +199,17 @@ func (s *Server) handleRecordingStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	codec := strings.TrimSpace(req.Codec)
+	if codec != "" && !slices.Contains(camera.SupportedCodec, codec) {
+		writeProblem(w, r, http.StatusBadRequest,
+			fmt.Sprintf("codec %q is not supported by camera_enum %d on device %q", codec, camera.CameraEnum, deviceID))
+		return
+	}
+
 	stream, err := s.store.Streams.Create(r.Context(), deviceID, cameraEnum, domain.StreamMetadata{
 		Resolution: camera.Resolution,
 		FPS:        camera.FPS,
+		Codec:      codec,
 		Codecs:     append([]string(nil), camera.SupportedCodec...),
 	})
 	if err != nil {
@@ -162,14 +225,18 @@ func (s *Server) handleRecordingStart(w http.ResponseWriter, r *http.Request) {
 	// immediately after the device acknowledges are captured.
 	s.media.StartStream(*stream)
 
+	payload := map[string]any{
+		ws.PKCameraEnum: cameraEnum,
+		ws.PKStreamID:   stream.ID,
+	}
+	if codec != "" {
+		payload[ws.PKCodec] = codec
+	}
 	msg := ws.Message{
 		Channel: ws.ChannelControl,
 		Type:    ws.CommandStartRecording,
 		ID:      ulid.Make().String(),
-		Payload: map[string]any{
-			ws.PKCameraEnum: cameraEnum,
-			ws.PKStreamID:   stream.ID,
-		},
+		Payload: payload,
 	}
 	if !s.sendCommand(w, r, deviceID, msg) {
 		if err := s.media.StopStream(r.Context(), *stream); err != nil {

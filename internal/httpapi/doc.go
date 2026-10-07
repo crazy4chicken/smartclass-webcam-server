@@ -135,9 +135,28 @@ type docDeviceUpdateRequest struct {
 	OwnerID  *string `json:"owner_id,omitempty"`
 }
 
-// docCameraCommandRequest mirrors the body shared by the four command routes.
+// docCameraCommandRequest mirrors the body shared by the stop-recording and
+// take-photo routes, which act on the camera the device is already using.
 type docCameraCommandRequest struct {
 	CameraEnum *int `json:"camera_enum"`
+}
+
+// docSwitchRequest mirrors the switch-camera body: the camera to select and,
+// optionally, the parameters to select it at. An omitted parameter is left
+// unchanged, so a switch to another camera leaves that camera at the
+// parameters it reported.
+type docSwitchRequest struct {
+	CameraEnum *int    `json:"camera_enum"`
+	Resolution *string `json:"resolution,omitempty"`
+	FPS        *int    `json:"fps,omitempty"`
+}
+
+// docRecordingStartRequest mirrors the recording-start body: the camera to
+// record and, optionally, the codec to record it with. An omitted codec lets
+// the device pick its preferred one, the first entry of supported_codec.
+type docRecordingStartRequest struct {
+	CameraEnum *int    `json:"camera_enum"`
+	Codec      *string `json:"codec,omitempty"`
 }
 
 // docSwitchAccepted mirrors the 202 body of the camera switch command.
@@ -309,6 +328,25 @@ var (
 	docCameraCodecEmpty   = docError(400, `cameras[<index>].supported_codec must not be empty`, "Invalid Request")
 	docCameraCodecRepeat  = docError(400, `cameras[<index>].supported_codec must not contain duplicates`, "Invalid Request")
 	docCameraCodecUnknown = docError(400, `cameras[<index>].supported_codec[<codec>] must be one of `+strings.Join(ws.SupportedCodecNames(), ", "), "Invalid Request")
+
+	// The supported lists bound what a later switch may select, so the
+	// parameters a camera is at must appear in them.
+	docCameraResolutionsEmpty       = docError(400, `cameras[<index>].supported_resolutions must not be empty`, "Invalid Request")
+	docCameraResolutionEntryEmpty   = docError(400, `cameras[<index>].supported_resolutions[<resolution>] must not be empty`, "Invalid Request")
+	docCameraResolutionsRepeat      = docError(400, `cameras[<index>].supported_resolutions must not contain duplicates`, "Invalid Request")
+	docCameraResolutionSupported    = docError(400, `cameras[<index>].resolution must be one of the supported_resolutions`, "Invalid Request")
+	docCameraFrameratesEmpty        = docError(400, `cameras[<index>].supported_framerates must not be empty`, "Invalid Request")
+	docCameraFramerateEntryPositive = docError(400, `cameras[<index>].supported_framerates[<fps>] must be positive`, "Invalid Request")
+	docCameraFrameratesRepeat       = docError(400, `cameras[<index>].supported_framerates must not contain duplicates`, "Invalid Request")
+	docCameraFPSSupported           = docError(400, `cameras[<index>].fps must be one of the supported_framerates`, "Invalid Request")
+)
+
+// The optional switch parameters and the recording codec must each be a value
+// the camera declared during registration.
+var (
+	docSwitchResolutionUnsupported = docError(400, `resolution "<resolution>" is not supported by camera_enum <camera_enum> on device "<device_id>"`, "Invalid Request")
+	docSwitchFPSUnsupported        = docError(400, `fps <fps> is not supported by camera_enum <camera_enum> on device "<device_id>"`, "Invalid Request")
+	docRecordingCodecUnsupported   = docError(400, `codec "<codec>" is not supported by camera_enum <camera_enum> on device "<device_id>"`, "Invalid Request")
 )
 
 var (
@@ -344,17 +382,21 @@ var (
 		"online":     true,
 		"cameras": []any{
 			map[string]any{
-				"camera_enum":     0,
-				"resolution":      "1920x1080",
-				"fps":             30,
-				"supported_codec": []any{"h264", "mjpeg"},
-				"attrs":           map[string]any{"label": "front"},
+				"camera_enum":           0,
+				"resolution":            "1920x1080",
+				"fps":                   30,
+				"supported_resolutions": []any{"1920x1080", "1280x720"},
+				"supported_framerates":  []any{30, 15},
+				"supported_codec":       []any{"h264", "mjpeg"},
+				"attrs":                 map[string]any{"label": "front"},
 			},
 			map[string]any{
-				"camera_enum":     1,
-				"resolution":      "1280x720",
-				"fps":             15,
-				"supported_codec": []any{"mjpeg"},
+				"camera_enum":           1,
+				"resolution":            "1280x720",
+				"fps":                   15,
+				"supported_resolutions": []any{"1280x720"},
+				"supported_framerates":  []any{15},
+				"supported_codec":       []any{"mjpeg"},
 			},
 		},
 	}
@@ -449,17 +491,21 @@ var (
 		"device_id": "01J8Z4W3K5M7Q9R1T3V5X7Z9B1",
 		"cameras": []any{
 			map[string]any{
-				"camera_enum":     0,
-				"resolution":      "1920x1080",
-				"fps":             30,
-				"supported_codec": []any{"h264", "mjpeg"},
-				"attrs":           map[string]any{"label": "front"},
+				"camera_enum":           0,
+				"resolution":            "1920x1080",
+				"fps":                   30,
+				"supported_resolutions": []any{"1920x1080", "1280x720"},
+				"supported_framerates":  []any{30, 15},
+				"supported_codec":       []any{"h264", "mjpeg"},
+				"attrs":                 map[string]any{"label": "front"},
 			},
 			map[string]any{
-				"camera_enum":     1,
-				"resolution":      "1280x720",
-				"fps":             15,
-				"supported_codec": []any{"mjpeg"},
+				"camera_enum":           1,
+				"resolution":            "1280x720",
+				"fps":                   15,
+				"supported_resolutions": []any{"1280x720"},
+				"supported_framerates":  []any{15},
+				"supported_codec":       []any{"mjpeg"},
 			},
 		},
 	}
@@ -509,7 +555,7 @@ var DocOperations = []apidocs.Operation{
 		Path:            "/ws/register",
 		Tag:             "WebSocket",
 		Summary:         "Register a device",
-		Description:     "Use from a device agent to announce its cameras and obtain a single-use WebSocket ticket. The device token travels in the Authorization header because this call carries a JSON body; an unknown device and a wrong token answer the same 401 so the endpoint never leaks which devices exist. Camera parameters live only in the registration: camera_enum must be exactly 0..n-1 in the order given, resolution must not be empty, fps must be positive and supported_codec must be non-empty with every element one of " + strings.Join(ws.SupportedCodecNames(), ", ") + ". Registering again invalidates the device's previous unused ticket, and the returned device_websocket_id expires after the configured ticket TTL when it is never redeemed.",
+		Description:     "Use from a device agent to announce its cameras and obtain a single-use WebSocket ticket. The device token travels in the Authorization header because this call carries a JSON body; an unknown device and a wrong token answer the same 401 so the endpoint never leaks which devices exist. Camera parameters live only in the registration: camera_enum must be exactly 0..n-1 in the order given; resolution and fps are the parameters that camera is at for the current connection and must each appear in supported_resolutions and supported_framerates, two non-empty duplicate-free lists whose entries the server trims and whose frame rates must be positive; supported_codec must be non-empty with every element one of " + strings.Join(ws.SupportedCodecNames(), ", ") + ". A device captures from exactly one camera at exactly one resolution and frame rate at a time, and only a switch_camera command selects another camera or another pair; a device never changes them on its own. Registering again invalidates the device's previous unused ticket, and the returned device_websocket_id expires after the configured ticket TTL when it is never redeemed.",
 		Request:         docRegisterRequest{},
 		RequestExample:  registerRequestExample,
 		Response:        docRegisterResponse{},
@@ -521,8 +567,16 @@ var DocOperations = []apidocs.Operation{
 			docCamerasEmpty,
 			docCameraEnumOrder,
 			docCameraResolution,
+			docCameraResolutionsEmpty,
 			docCameraFPS,
+			docCameraFrameratesEmpty,
 			docCameraCodecEmpty,
+			docCameraResolutionEntryEmpty,
+			docCameraResolutionsRepeat,
+			docCameraResolutionSupported,
+			docCameraFramerateEntryPositive,
+			docCameraFrameratesRepeat,
+			docCameraFPSSupported,
 			docCameraCodecUnknown,
 			docCameraCodecRepeat,
 			docDeviceAuthMissing,
@@ -587,7 +641,7 @@ var DocOperations = []apidocs.Operation{
 		Path:            "/api/devices/{device_id}/",
 		Tag:             "Devices",
 		Summary:         "Get a device",
-		Description:     "Use to fetch one device's stored fields together with its live state: online reports whether a device WebSocket is attached right now, and cameras lists the camera parameters of the current registration (empty while the device is offline).",
+		Description:     "Use to fetch one device's stored fields together with its live state: online reports whether a device WebSocket is attached right now, and cameras lists the capabilities of the current registration - the resolution and frame rate each camera is at together with the supported_resolutions, supported_framerates and supported_codec lists a switch or a recording may select (empty while the device is offline).",
 		Security:        "bearerAuth",
 		Response:        docDeviceDetail{},
 		ResponseExample: deviceDetailExample,
@@ -646,10 +700,10 @@ var DocOperations = []apidocs.Operation{
 		Path:            "/api/devices/{device_id}/camera/switch",
 		Tag:             "Devices",
 		Summary:         "Switch the active camera",
-		Description:     "Use to make one of the device's cameras the active one for subsequent operations. The device must be online (409 otherwise) and the camera enum must belong to its current registration (400 otherwise). The command is queued to the device and answers 202 Accepted with the command id; the device reports the outcome asynchronously over the control channel.",
+		Description:     "Use to make one of the device's cameras the active one, optionally at new parameters. A device captures from exactly one camera at exactly one resolution and frame rate at a time, and only this command selects another camera or another pair; a device never changes them on its own. The device must be online (409 otherwise) and the camera enum must belong to its current registration (400 otherwise). resolution and fps are optional and must each be a value the camera declared during registration (400 otherwise); when one is absent it stays unchanged, so a switch to another camera leaves that camera at the parameters it reported. The command is queued to the device and answers 202 Accepted with the command id; the device reports the outcome asynchronously over the control channel.",
 		Security:        "bearerAuth",
-		Request:         docCameraCommandRequest{},
-		RequestExample:  map[string]any{"camera_enum": 1},
+		Request:         docSwitchRequest{},
+		RequestExample:  map[string]any{"camera_enum": 1, "resolution": "1280x720", "fps": 15},
 		Response:        docSwitchAccepted{},
 		ResponseExample: switchAcceptedExample,
 		Errors: []apidocs.ErrorDoc{
@@ -658,6 +712,8 @@ var DocOperations = []apidocs.Operation{
 			docBodyTooLarge,
 			docError(400, "camera_enum is required", "Invalid Request"),
 			docCameraEnumUnknown,
+			docSwitchResolutionUnsupported,
+			docSwitchFPSUnsupported,
 			docUnauthorized,
 			docForbidden("control"),
 			docDeviceNotFound,
@@ -672,10 +728,10 @@ var DocOperations = []apidocs.Operation{
 		Path:            "/api/devices/{device_id}/recording/start",
 		Tag:             "Streams",
 		Summary:         "Start a recording stream",
-		Description:     "Use to begin recording one camera of a device. The camera enum is validated against the device's current registration (400 when unknown, 409 when the device has no live session) and a stream must not already be active for that camera (409 otherwise). The server creates the stream row first — snapshotting the camera's resolution, fps and codec list into its metadata — then tells the device to start pushing frames and stores each uploaded chunk as a segment in object storage. The request answers 201 Created with the new stream and its URL in the Location header; a stream whose start command cannot be delivered is marked failed.",
+		Description:     "Use to begin recording one camera of a device. The camera enum is validated against the device's current registration (400 when unknown, 409 when the device has no live session) and a stream must not already be active for that camera (409 otherwise). The recording runs on the camera's current resolution and frame rate; only the codec can be chosen, and only here - never on a camera switch or a photo. The optional codec must be a value the camera declared during registration (400 otherwise); when it is absent the device records with its preferred codec, the first entry of the camera's supported_codec list. The server creates the stream row first - snapshotting the camera's resolution and fps, its whole codec list into metadata.codecs and the requested codec into metadata.codec (omitted when none was named) - then tells the device to start pushing frames and stores each uploaded chunk as a segment in object storage. The request answers 201 Created with the new stream and its URL in the Location header; a stream whose start command cannot be delivered is marked failed.",
 		Security:        "bearerAuth",
-		Request:         docCameraCommandRequest{},
-		RequestExample:  map[string]any{"camera_enum": 0},
+		Request:         docRecordingStartRequest{},
+		RequestExample:  map[string]any{"camera_enum": 0, "codec": "h264"},
 		Response:        domain.Stream{},
 		ResponseExample: streamExample,
 		Errors: []apidocs.ErrorDoc{
@@ -684,6 +740,7 @@ var DocOperations = []apidocs.Operation{
 			docBodyTooLarge,
 			docError(400, "camera_enum is required", "Invalid Request"),
 			docCameraEnumUnknown,
+			docRecordingCodecUnsupported,
 			docUnauthorized,
 			docForbidden("control"),
 			docDeviceNotFound,
@@ -728,7 +785,7 @@ var DocOperations = []apidocs.Operation{
 		Path:            "/api/devices/{device_id}/photo",
 		Tag:             "Photos",
 		Summary:         "Capture a photo",
-		Description:     "Use to ask a camera for a single still image. The device must be online (409 otherwise) and the camera enum must belong to its current registration (400 otherwise). The command is queued to the device and answers 202 Accepted with the command id and request id; the device later uploads a photo binary frame carrying the same request_id, and the uploaded photo becomes visible under the device's photos.",
+		Description:     "Use to ask a camera for a single still image. The device must be online (409 otherwise) and the camera enum must belong to its current registration (400 otherwise). Still images are always JPEG: the upload either omits content_type or sets it to image/jpeg, any other value is discarded by the server so no photo record appears, and every stored photo reports content_type image/jpeg. The command is queued to the device and answers 202 Accepted with the command id and request id; the device later uploads a photo binary frame carrying the same request_id, and the uploaded photo becomes visible under the device's photos.",
 		Security:        "bearerAuth",
 		Request:         docCameraCommandRequest{},
 		RequestExample:  map[string]any{"camera_enum": 0},

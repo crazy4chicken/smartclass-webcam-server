@@ -10,14 +10,22 @@ import (
 )
 
 // CameraCapability describes one camera a device announces during
-// registration. Camera parameters are ephemeral: they live in the registration
-// and are never persisted.
+// registration. Resolution and FPS are the parameters this camera is at for
+// the current connection: a device captures from exactly one camera at exactly
+// one resolution and frame rate at a time, and only a switch_camera command
+// selects another camera or another pair. SupportedResolutions and
+// SupportedFramerates bound what a switch may select, and SupportedCodec is
+// ordered by preference, so its first entry is the codec a recording uses when
+// the server names none. Camera parameters are ephemeral: they live in the
+// registration and are never persisted.
 type CameraCapability struct {
-	CameraEnum     int            `json:"camera_enum"`
-	Resolution     string         `json:"resolution"`
-	FPS            int            `json:"fps"`
-	SupportedCodec []string       `json:"supported_codec"`
-	Attrs          map[string]any `json:"attrs,omitempty"`
+	CameraEnum           int            `json:"camera_enum"`
+	Resolution           string         `json:"resolution"`
+	FPS                  int            `json:"fps"`
+	SupportedResolutions []string       `json:"supported_resolutions"`
+	SupportedFramerates  []int          `json:"supported_framerates"`
+	SupportedCodec       []string       `json:"supported_codec"`
+	Attrs                map[string]any `json:"attrs,omitempty"`
 }
 
 // Registration is one device registration. It is a pending, single-use ticket
