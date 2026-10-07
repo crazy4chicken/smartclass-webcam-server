@@ -118,17 +118,20 @@ func (a *Auth) RequireDevice(action string, load func(*http.Request) (*domain.De
 }
 
 // grantCollection evaluates the ladder of collection permission keys and
-// returns the first matching scope. Collections have no resource identity, so
-// every key is evaluated with an empty iam.Resource.
+// returns the first matching scope. A collection has no single device, so each
+// rung is evaluated against the slice its scope selects: no resource identity
+// for any, the caller's team for team, and the caller's subject for own. The
+// SDK requires a non-empty resource team before a :team key or a team-scoped
+// grant can match, and ABAC conditions then see the same identity the resolved
+// scope filters the collection by.
 func (a *Auth) grantCollection(ctx context.Context, claims iam.Claims, action string) (AccessGrant, bool) {
-	resource := iam.Resource{}
-	if a.allows(ctx, claims, action, ScopeAny, resource) {
+	if a.allows(ctx, claims, action, ScopeAny, iam.Resource{}) {
 		return AccessGrant{Scope: ScopeAny, Claims: claims}, true
 	}
-	if claims.Team != "" && a.allows(ctx, claims, action, ScopeTeam, resource) {
+	if claims.Team != "" && a.allows(ctx, claims, action, ScopeTeam, iam.Resource{TeamID: claims.Team}) {
 		return AccessGrant{Scope: ScopeTeam, Claims: claims}, true
 	}
-	if claims.Subject != "" && a.allows(ctx, claims, action, ScopeOwn, resource) {
+	if claims.Subject != "" && a.allows(ctx, claims, action, ScopeOwn, iam.Resource{OwnerID: claims.Subject}) {
 		return AccessGrant{Scope: ScopeOwn, Claims: claims}, true
 	}
 	return AccessGrant{}, false
