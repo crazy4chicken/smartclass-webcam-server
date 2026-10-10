@@ -92,8 +92,13 @@ One camera at one pair: `resolution` and `fps` are the parameters a camera is at
 connection, not a free choice. A device captures from exactly one camera at exactly one resolution
 and frame rate at a time, and only a `switch_camera` command selects another camera or another
 pair — a device never changes them on its own (see
-[Control channel](/protocol/control#switch-camera)). `supported_resolutions` and
-`supported_framerates` bound what a switch may later select and must contain the current pair.
+[Control channel](/protocol/control#switch-camera)). The server performs the change on its side
+too, but only once the device confirms it: a `switch_camera` the device acknowledges with `ok:
+true` rewrites that camera's `resolution` and `fps` in the live registration to the pair the
+command named, so the value a camera is at and the value the registration reports stay the same
+until the device re-registers. A failed acknowledgement, or none at all, leaves the registration
+as it was. `supported_resolutions` and `supported_framerates` bound what a switch may later select
+and must contain the current pair.
 
 Decoder behavior, verified against the implementation:
 

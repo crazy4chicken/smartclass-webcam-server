@@ -50,7 +50,11 @@ Camera parameters (`resolution`, `fps`, `supported_resolutions`, `supported_fram
 server keeps them only in the live registration, never in the device record. `resolution` and
 `fps` are the parameters a camera is at for the current connection — a device captures from exactly
 one camera at exactly one resolution and frame rate at a time, and only a `switch_camera` command
-selects another camera or another pair; a device never changes them on its own.
+selects another camera or another pair; a device never changes them on its own. When a device
+acknowledges such a switch with `ok: true`, the server rewrites that camera's `resolution` and
+`fps` in the live registration, so the device detail and the metadata of a stream started
+afterwards report the pair the camera is at rather than the one it registered with; a failed or
+missing acknowledgement leaves them as they were.
 
 ## Endpoint map
 

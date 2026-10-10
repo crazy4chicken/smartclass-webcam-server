@@ -16,6 +16,10 @@ type RecordingHandler func(deviceID, streamID string, cameraEnum int, seq int64,
 // device's read goroutine and must not block for long.
 type PhotoHandler func(deviceID string, cameraEnum int, requestID, contentType string, ts time.Time, data []byte)
 
+// AckHandler receives one acknowledgement a device sent for a server command.
+// Handlers run on the device's read goroutine and must not block for long.
+type AckHandler func(deviceID, commandID string, payload map[string]any)
+
 // Errors reported by Hub.Send and Client acknowledgements.
 var (
 	// ErrDeviceNotConnected is returned when the device has no live connection.
@@ -33,6 +37,7 @@ type Hub struct {
 	clients   map[string]*Client
 	recording RecordingHandler
 	photo     PhotoHandler
+	ack       AckHandler
 }
 
 // NewHub creates an empty hub.
@@ -121,6 +126,24 @@ func (h *Hub) SetPhotoHandler(fn PhotoHandler) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.photo = fn
+}
+
+// SetAckHandler replaces the handler invoked for command acknowledgements.
+func (h *Hub) SetAckHandler(fn AckHandler) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.ack = fn
+}
+
+// dispatchAck delivers an acknowledgement to the registered handler.
+func (h *Hub) dispatchAck(deviceID, commandID string, payload map[string]any) {
+	h.mu.RLock()
+	fn := h.ack
+	h.mu.RUnlock()
+
+	if fn != nil {
+		fn(deviceID, commandID, payload)
+	}
 }
 
 // dispatchRecording delivers a recording frame to the registered handler.

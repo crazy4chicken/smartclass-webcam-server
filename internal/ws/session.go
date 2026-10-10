@@ -17,7 +17,8 @@ import (
 // SupportedFramerates bound what a switch may select, and SupportedCodec is
 // ordered by preference, so its first entry is the codec a recording uses when
 // the server names none. Camera parameters are ephemeral: they live in the
-// registration and are never persisted.
+// registration and are never persisted. Resolution and FPS are rewritten by the
+// server when the device acknowledges a switch_camera that names them.
 type CameraCapability struct {
 	CameraEnum           int            `json:"camera_enum"`
 	Resolution           string         `json:"resolution"`
@@ -34,16 +35,104 @@ type CameraCapability struct {
 type Registration struct {
 	WebsocketID string
 	DeviceID    string
-	Cameras     []CameraCapability
 	CreatedAt   time.Time
 	ExpiresAt   time.Time
 
 	client *Client // set once by Attach, never cleared
+
+	// cameras and pending are guarded by mu: the registry mutex protects the
+	// maps, not the registration a caller already holds, and the ack handler
+	// rewrites the current parameters while detail reads and media frames look
+	// the cameras up.
+	mu      sync.RWMutex
+	cameras []CameraCapability
+	// pending holds the switches queued to the device and not yet resolved by
+	// an ack, keyed by command id. It dies with the registration, so a device
+	// that never acks leaves no trace beyond a stale entry.
+	pending map[string]pendingSwitch
+}
+
+// pendingSwitch is a switch_camera waiting for its ack. A parameter left out of
+// the request is not stored, so resolving the ack keeps the value the camera is
+// at when the ack arrives - the same rule the device applies on receipt.
+type pendingSwitch struct {
+	cameraEnum int
+	resolution string // "" keeps the camera's current resolution
+	fps        *int   // nil keeps the camera's current frame rate
+}
+
+// QueueSwitch records the switch identified by commandID as pending. It does
+// not touch the camera: only an acknowledgement applies it. fps is copied, so
+// the caller may reuse it.
+func (r *Registration) QueueSwitch(commandID string, cameraEnum int, resolution string, fps *int) {
+	var requested *int
+	if fps != nil {
+		value := *fps
+		requested = &value
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.pending == nil {
+		r.pending = make(map[string]pendingSwitch)
+	}
+	r.pending[commandID] = pendingSwitch{cameraEnum: cameraEnum, resolution: resolution, fps: requested}
+}
+
+// ResolveSwitch resolves the pending switch identified by commandID. It reports
+// false when the registration holds no such switch, which is the case for an
+// unknown or already resolved command id and after the connection was replaced.
+// An acknowledged switch (ok) rewrites the camera's current parameters; an
+// acknowledgement reporting failure drops the pending switch and changes
+// nothing.
+func (r *Registration) ResolveSwitch(commandID string, ok bool) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	pending, found := r.pending[commandID]
+	if !found {
+		return false
+	}
+	delete(r.pending, commandID)
+	if !ok {
+		return false
+	}
+
+	for i, cam := range r.cameras {
+		if cam.CameraEnum != pending.cameraEnum {
+			continue
+		}
+		if pending.resolution != "" {
+			r.cameras[i].Resolution = pending.resolution
+		}
+		if pending.fps != nil {
+			r.cameras[i].FPS = *pending.fps
+		}
+		return true
+	}
+	return false
+}
+
+// DiscardSwitch drops the pending switch identified by commandID, for a command
+// the server could not queue and that therefore no acknowledgement can name.
+func (r *Registration) DiscardSwitch(commandID string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.pending, commandID)
+}
+
+// Cameras returns a copy of the live session's camera capabilities.
+func (r *Registration) Cameras() []CameraCapability {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return append([]CameraCapability(nil), r.cameras...)
 }
 
 // Camera returns the capability of the camera with the given enum.
 func (r *Registration) Camera(enum int) (CameraCapability, bool) {
-	for _, cam := range r.Cameras {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for _, cam := range r.cameras {
 		if cam.CameraEnum == enum {
 			return cam, true
 		}
@@ -93,7 +182,7 @@ func (g *Registry) Create(deviceID string, cameras []CameraCapability) (*Registr
 	reg := &Registration{
 		WebsocketID: id,
 		DeviceID:    deviceID,
-		Cameras:     append([]CameraCapability(nil), cameras...),
+		cameras:     append([]CameraCapability(nil), cameras...),
 		CreatedAt:   now,
 		ExpiresAt:   now.Add(g.ttl),
 	}

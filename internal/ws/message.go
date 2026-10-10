@@ -51,6 +51,8 @@ const (
 	PKTS          = "ts"
 	PKRequestID   = "request_id"
 	PKContentType = "content_type"
+	// PKOk is the acknowledgement payload's success flag.
+	PKOk = "ok"
 )
 
 // maxHeaderSize bounds the JSON header of a binary media frame in bytes.

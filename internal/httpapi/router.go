@@ -64,6 +64,9 @@ func NewRouter(authn *auth.Auth, st *store.Store, hub *ws.Hub, registry *ws.Regi
 		sanitize: sanitize,
 		media:    newMediaManager(st, objects, registry, hub),
 	}
+	// An acknowledgement carries the only deferred command effect: it applies a
+	// switch_camera the server queued but did not yet record.
+	hub.SetAckHandler(s.handleCommandAck)
 
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)

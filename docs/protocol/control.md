@@ -68,10 +68,15 @@ command selects another camera or another pair, and a device never changes them 
 - **Device obligations.** Apply the switch to whatever "active camera" means locally (the camera
   used for the next capture/stream), at the new `resolution` and/or `fps` when they are present,
   and answer with an `ack`. A parameter that is absent keeps its current value, so a switch to
-  another camera leaves that camera at the parameters it reported in its registration. There is no
-  server-side active-camera state: the server records nothing about the switch beyond the HTTP
-  response, so the ack is the only confirmation an operator can get.
-- **Server state.** None. No record is created or updated.
+  another camera leaves that camera at the parameters it reported in its registration.
+- **Server state.** The endpoint queues the switch without touching the live registration, and the
+  `ack` it expects is what applies it: an `ack` echoing `id` with `payload.ok: true` rewrites that
+  camera's `resolution` and `fps` in the live registration to the pair the command named, so a
+  later `GET /api/devices/{device_id}/` and the `metadata` of a stream started afterwards report the
+  camera's real parameters. An `ack` with `payload.ok: false` — the device could not switch —
+  applies nothing, and so does no `ack` at all: the command is emitted once and never retried, and a
+  pending switch dies with the connection it was queued on. Nothing is persisted either way, and a
+  switch whose command could not be queued at all (a `502`) was never recorded.
 
 ### `start_recording`
 
@@ -264,10 +269,12 @@ Failure with a reason (complete document):
 Server behavior, exactly as implemented: the frame is decoded, and the ack is logged at **debug**
 level (`device acknowledged command`) together with its `id` and the whole payload. The server
 does not validate the payload — an `ack` without `ok`, or with `ok` as a string, is still accepted
-and logged. Nothing is persisted, nothing is retried, and no HTTP request is still waiting: the
-operator's call already returned `202`/`201`/`200` as soon as the command was queued. An `ok:
-false` ack therefore never changes the HTTP result and never rolls back server state created by
-the trigger (for example the stream row of `recording/start`).
+and logged. One deferred effect hangs on the payload: a `switch_camera` the device acknowledges
+with `ok: true` applies the parameters the command named to the live registration, while `ok:
+false` (or any non-`true` value) applies nothing. Nothing is persisted, nothing is retried, and no
+HTTP request is still waiting: the operator's call already returned `202`/`201`/`200` as soon as
+the command was queued. An `ok: false` ack therefore never changes the HTTP result and never rolls
+back server state created by the trigger (for example the stream row of `recording/start`).
 
 ### `pong`
 
@@ -516,8 +523,9 @@ Stream resource fields:
 | `metadata` | object | Always | `resolution`: free-form string as announced (`WIDTHxHEIGHT` convention); `fps`: integer > 0 as announced; `codecs`: array of the announced values, order preserved, each one of `h264`, `h265`, `mjpeg`, `mpeg4`, `vp8`, `vp9`, `av1`; `codec`: the codec requested at `recording/start`, one of the announced values, omitted when none was named. | Camera snapshot taken at start. `metadata.codecs` is the announced list, not a negotiated codec — see [Codec values](/protocol/registration#codec-values). |
 
 Only the recording endpoints touch the database: `recording/start` inserts the stream row and
-`recording/stop` finishes it. `camera/switch` just asks the device to switch, and `photo` mints a
-`request_id` — neither writes a row.
+`recording/stop` finishes it. `camera/switch` rewrites the camera's parameters in the live
+registration once the device acks it — memory only, no row — and `photo` mints a `request_id`;
+neither writes a row.
 
 ### Failure semantics
 

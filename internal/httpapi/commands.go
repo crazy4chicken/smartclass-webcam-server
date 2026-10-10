@@ -122,10 +122,28 @@ func (s *Server) sendCommand(w http.ResponseWriter, r *http.Request, deviceID st
 	return true
 }
 
+// handleCommandAck resolves the deferred effect of an acknowledgement the
+// device sent for a queued command. Only a switch_camera has one, and only a
+// payload carrying ok: true applies it: the camera's current parameters move to
+// the pair the command named, so the device detail and the metadata of a stream
+// started afterwards report the camera's real state rather than the pair it
+// registered with. An ack naming an unknown or already resolved command, or one
+// whose payload is not ok: true, changes nothing - the device failed the switch,
+// or never answered - and the registration keeps the parameters it had.
+func (s *Server) handleCommandAck(deviceID, commandID string, payload map[string]any) {
+	registration, ok := s.registry.Current(deviceID)
+	if !ok {
+		return
+	}
+	registration.ResolveSwitch(commandID, payload[ws.PKOk] == true)
+}
+
 // handleCameraSwitch handles POST /api/devices/{device_id}/camera/switch. The
 // device switches to the requested camera and, when the request names them, to
 // the requested resolution and frame rate; both must be ones the camera
-// declared during registration.
+// declared during registration. The switch is queued as pending and only the
+// device's ok acknowledgement applies it, so a later device read and the
+// metadata of a stream started afterwards report the pair the camera moved to.
 func (s *Server) handleCameraSwitch(w http.ResponseWriter, r *http.Request) {
 	var req switchRequest
 	if !s.decodeJSON(w, r, &req) {
@@ -146,13 +164,16 @@ func (s *Server) handleCameraSwitch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	payload := map[string]any{ws.PKCameraEnum: camera.CameraEnum}
-	if resolution := strings.TrimSpace(req.Resolution); resolution != "" {
-		if !slices.Contains(camera.SupportedResolutions, resolution) {
+	// A parameter the request leaves out keeps the value the camera is at when
+	// the switch is applied, so the pending switch stores only what was named.
+	requested := strings.TrimSpace(req.Resolution)
+	if requested != "" {
+		if !slices.Contains(camera.SupportedResolutions, requested) {
 			writeProblem(w, r, http.StatusBadRequest,
-				fmt.Sprintf("resolution %q is not supported by camera_enum %d on device %q", resolution, camera.CameraEnum, deviceID))
+				fmt.Sprintf("resolution %q is not supported by camera_enum %d on device %q", requested, camera.CameraEnum, deviceID))
 			return
 		}
-		payload[ws.PKResolution] = resolution
+		payload[ws.PKResolution] = requested
 	}
 	if req.FPS != nil {
 		if !slices.Contains(camera.SupportedFramerates, *req.FPS) {
@@ -169,7 +190,13 @@ func (s *Server) handleCameraSwitch(w http.ResponseWriter, r *http.Request) {
 		ID:      ulid.Make().String(),
 		Payload: payload,
 	}
+	// The pending switch is recorded before the command is queued: a device may
+	// acknowledge it before the handler returns, and an ack for an unknown
+	// command id is dropped.
+	registration.QueueSwitch(msg.ID, camera.CameraEnum, requested, req.FPS)
 	if !s.sendCommand(w, r, deviceID, msg) {
+		// The command never reached the device, so nothing can acknowledge it.
+		registration.DiscardSwitch(msg.ID)
 		return
 	}
 	writeJSON(w, http.StatusAccepted, commandResponse{CommandID: msg.ID, CameraEnum: camera.CameraEnum})

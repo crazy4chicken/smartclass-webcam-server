@@ -135,6 +135,7 @@ func (c *Client) handleText(raw []byte) {
 		// Keepalive only; the read deadline was already refreshed.
 	case ControlAck:
 		slog.Debug("device acknowledged command", "device_id", c.deviceID, "id", msg.ID, "payload", msg.Payload)
+		c.hub.dispatchAck(c.deviceID, msg.ID, msg.Payload)
 	case ControlStatus:
 		slog.Info("device status", "device_id", c.deviceID, "payload", msg.Payload)
 	case ControlError:

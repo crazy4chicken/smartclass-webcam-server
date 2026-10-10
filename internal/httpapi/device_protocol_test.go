@@ -16,8 +16,10 @@ import (
 // TestDeviceProtocol drives the device plane end to end: a device registers its
 // cameras over HTTP, attaches over the WebSocket, and receives the control
 // commands the API issues. It pins what the upgrade promises: the switch
-// carries the resolution and frame rate the caller named, a recording carries
-// the codec it alone may name, a parameter the camera did not declare is
+// carries the resolution and frame rate the caller named and records them in
+// the live session once the device acknowledges them, a failed acknowledgement
+// records nothing, a recording carries the codec it alone may name and
+// snapshots those parameters, a parameter the camera did not declare is
 // refused, and a photo that is not JPEG is discarded.
 func TestDeviceProtocol(t *testing.T) {
 	m := newMatrix(t)
@@ -57,7 +59,8 @@ func TestDeviceProtocol(t *testing.T) {
 	m.expectLive(http.MethodPost, "/api/devices/"+device+"/recording/start", `{"camera_enum":0,"codec":"hevc"}`, m.token(operator),
 		http.StatusBadRequest, `codec "hevc" is not supported by camera_enum 0 on device "`+device+`"`)
 
-	// The switch carries the parameters the caller named.
+	// The switch carries the parameters the caller named, and the device has
+	// not confirmed it yet, so nothing is recorded.
 	m.expectLive(http.MethodPost, "/api/devices/"+device+"/camera/switch", `{"camera_enum":0,"resolution":"1280x720","fps":15}`, m.token(operator),
 		http.StatusAccepted, `"camera_enum":0`)
 	command := readDeviceCommand(t, conn)
@@ -69,15 +72,25 @@ func TestDeviceProtocol(t *testing.T) {
 		ws.PKResolution: "1280x720",
 		ws.PKFPS:        float64(15),
 	})
+	m.expectLive(http.MethodGet, "/api/devices/"+device+"/", "", m.token(operator), http.StatusOK,
+		`"resolution":"1920x1080"`, `"fps":30`)
 
 	// A switch without parameters leaves the parameters to the device.
 	m.expectLive(http.MethodPost, "/api/devices/"+device+"/camera/switch", `{"camera_enum":0}`, m.token(operator),
 		http.StatusAccepted, `"camera_enum":0`)
 	assertPayload(t, readDeviceCommand(t, conn), map[string]any{ws.PKCameraEnum: float64(0)})
 
-	// A recording names its codec, and the stream records it.
+	// The device acknowledges the parameterized switch, which applies it: the
+	// device detail now reports the pair it named and the next stream snapshots
+	// it. The acknowledgement is asynchronous, so the read is retried.
+	sendDeviceAck(t, conn, command.ID, true)
+	waitForDetail(t, m, device, `"resolution":"1280x720"`, `"fps":15`)
+
+	// A recording names its codec, and the stream records it together with the
+	// parameters the acknowledged switch applied, not the ones it registered
+	// with.
 	m.expectLive(http.MethodPost, "/api/devices/"+device+"/recording/start", `{"camera_enum":0,"codec":"mjpeg"}`, m.token(operator),
-		http.StatusCreated, `"status":"active"`, `"codec":"mjpeg"`)
+		http.StatusCreated, `"status":"active"`, `"codec":"mjpeg"`, `"resolution":"1280x720"`, `"fps":15`)
 	start := readDeviceCommand(t, conn)
 	if start.Type != ws.CommandStartRecording {
 		t.Fatalf("command = %q, want %q", start.Type, ws.CommandStartRecording)
@@ -157,10 +170,32 @@ func TestDeviceProtocol(t *testing.T) {
 
 	m.expectLive(http.MethodPost, "/api/devices/"+padded+"/camera/switch", `{"camera_enum":0,"resolution":"1920x1080"}`, m.token(operator),
 		http.StatusAccepted, `"camera_enum":0`)
-	assertPayload(t, readDeviceCommand(t, paddedConn), map[string]any{
+	paddedSwitch := readDeviceCommand(t, paddedConn)
+	assertPayload(t, paddedSwitch, map[string]any{
 		ws.PKCameraEnum: float64(0),
 		ws.PKResolution: "1920x1080",
 	})
+
+	// A switch that names only the resolution leaves the frame rate at the
+	// value the registration reported, and the trimmed pair surfaces on the
+	// device once the device acks it: the live session never holds a parameter
+	// it was not validated against.
+	sendDeviceAck(t, paddedConn, paddedSwitch.ID, true)
+	waitForDetail(t, m, padded, `"resolution":"1920x1080"`, `"fps":30`)
+
+	// A failed acknowledgement is not applied: the camera keeps the parameters
+	// it had.
+	m.expectLive(http.MethodPost, "/api/devices/"+padded+"/camera/switch", `{"camera_enum":0,"resolution":"1280x720"}`, m.token(operator),
+		http.StatusAccepted, `"camera_enum":0`)
+	failedSwitch := readDeviceCommand(t, paddedConn)
+	assertPayload(t, failedSwitch, map[string]any{
+		ws.PKCameraEnum: float64(0),
+		ws.PKResolution: "1280x720",
+	})
+	sendDeviceAck(t, paddedConn, failedSwitch.ID, false)
+	time.Sleep(300 * time.Millisecond)
+	m.expectLive(http.MethodGet, "/api/devices/"+padded+"/", "", m.token(operator), http.StatusOK,
+		`"resolution":"1920x1080"`, `"fps":30`)
 }
 
 // expectLive issues one request over the listener and asserts its status and
@@ -207,6 +242,51 @@ func (m *matrix) liveCall(method, path, body, token string) (int, []byte) {
 	}
 	m.t.Logf("%-24s %-6s %-44s -> %d %s", "device", method, path, response.StatusCode, truncate(string(payload), 120))
 	return response.StatusCode, payload
+}
+
+// sendDeviceAck acknowledges commandID as the device would: the server applies
+// a switch_camera only when the acknowledgement carries ok: true.
+func sendDeviceAck(t *testing.T, conn *websocket.Conn, commandID string, ok bool) {
+	t.Helper()
+	raw, err := json.Marshal(ws.Message{
+		Channel: ws.ChannelControl,
+		Type:    ws.ControlAck,
+		ID:      commandID,
+		Payload: map[string]any{ws.PKOk: ok},
+	})
+	if err != nil {
+		t.Fatalf("encode ack: %v", err)
+	}
+	if err := conn.WriteMessage(websocket.TextMessage, raw); err != nil {
+		t.Fatalf("write ack: %v", err)
+	}
+	t.Logf("%-24s %-6s %-44s -> ack ok=%v", "device sent", "-", commandID, ok)
+}
+
+// waitForDetail polls the device detail until it contains every fragment, so an
+// acknowledgement applied asynchronously is visible before it is asserted.
+func waitForDetail(t *testing.T, m *matrix, deviceID string, contains ...string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	var last []byte
+	for time.Now().Before(deadline) {
+		status, body := m.liveCall(http.MethodGet, "/api/devices/"+deviceID+"/", "", m.token(operator))
+		last = body
+		if status == http.StatusOK {
+			matched := true
+			for _, want := range contains {
+				if !strings.Contains(string(body), want) {
+					matched = false
+					break
+				}
+			}
+			if matched {
+				return
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("device detail %s never named %v", last, contains)
 }
 
 // readDeviceCommand reads the next control command the server sends the device.

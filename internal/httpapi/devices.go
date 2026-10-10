@@ -155,7 +155,7 @@ func (s *Server) deviceDetail(device *domain.Device) deviceDetail {
 	detail := deviceDetail{Device: *device, Cameras: []ws.CameraCapability{}}
 	if registration, ok := s.registry.Current(device.ID); ok {
 		detail.Online = true
-		detail.Cameras = append(detail.Cameras, registration.Cameras...)
+		detail.Cameras = append(detail.Cameras, registration.Cameras()...)
 	}
 	return detail
 }
