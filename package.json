@@ -1,6 +1,6 @@
 {
   "name": "smartclass-webcam-server",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "SmartClass webcam server - docs tooling",
   "scripts": {
     "docs:dev": "vitepress dev docs",
